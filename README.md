@@ -10,6 +10,7 @@ This repository provides one MCP server process, not three separate servers. The
 
 - Exposes paper-search tools to GitHub Copilot in VS Code through MCP.
 - Searches Semantic Scholar, arXiv, and Crossref from one server.
+- Downloads and analyzes arXiv full text from source files or PDF, including figure and table captions when source files are available.
 - Supports deeper literature workflows such as citations, references, author lookup, recommendations, and Crossref journal/funder/type slices.
 - Normalizes paper metadata into a shared schema where practical.
 - Uses VS Code MCP input variables so secrets are not committed to the repository.
@@ -165,6 +166,7 @@ Environment variables consumed by the server:
 - `semantic_scholar_recommend_from_examples`: fetch recommendations from positive and negative example papers
 - `arxiv_search`: search arXiv via the Atom API
 - `arxiv_paper`: fetch a single arXiv paper by arXiv ID or URL
+- `arxiv_full_text`: download and analyze arXiv full text from source files or PDF, with figure/table captions when available
 - `crossref_search_works`: search Crossref works metadata
 - `crossref_work_by_doi`: fetch a Crossref work by DOI
 - `crossref_journal_works`: fetch Crossref works for a journal ISSN
@@ -173,6 +175,8 @@ Environment variables consumed by the server:
 - `search_papers`: run a normalized cross-source search from one tool call
 
 The normalized paper response includes fields such as source, source ID, title, authors, author details, abstract, publication and update dates, DOI, venue, publisher, URL, PDF URL, citation metrics, open-access hints, subjects, publication types, funders, and source-specific metadata when the upstream source provides them.
+
+The `arxiv_full_text` response additionally returns extracted full text, the extraction method used (`source` or `pdf`), truncation metadata, and figure/table caption data when source parsing succeeds.
 
 ## Run In VS Code
 
@@ -206,6 +210,7 @@ If tool metadata does not refresh after edits, run `MCP: Reset Cached Tools` and
 - Semantic Scholar exposes additional tools for paper batches, citations, references, authors, and recommendations.
 - arXiv uses the legacy query API and enforces single-request behavior with at least a 3-second interval between requests, matching the current arXiv API terms.
 - arXiv exact lookup uses `id_list` so you can fetch a specific paper and keep richer arXiv metadata.
+- arXiv full-text analysis prefers `/src/<id>` to parse TeX sources and extract figure/table captions, then falls back to `/pdf/<id>.pdf` text extraction when source files are unavailable or non-textual.
 - Crossref always sends both `mailto` and `User-Agent` using the configured contact email.
 - Crossref does not publish the same fixed RPS limit in the documentation referenced here, so this server uses the polite pool headers, caches responses, and backs off when Crossref responds with rate-limit or temporary-overload statuses.
 - Crossref exposes deeper slices through journal, funder, and type endpoints in addition to general works search.
@@ -419,6 +424,7 @@ macOS / Linux では Python 実行ファイルのパスを `.venv/bin/python` �
 - Semantic Scholar では一括取得、引用・被引用、著者、推薦論文の各 API も利用できます。
 - arXiv は legacy query API を使い、利用規約に合わせて単一接続かつ 3 秒以上の間隔を強制します。
 - arXiv の単一論文取得では `id_list` を使い、より正確に論文を取得します。
+- arXiv の全文解析では `/src/<id>` を優先して TeX source を解析し、図表 caption を抽出します。source が扱えない投稿では `/pdf/<id>.pdf` のテキスト抽出へ自動で fallback します。
 - Crossref には設定した連絡先メールアドレスを使って `mailto` と `User-Agent` を常に付与します。
 - Crossref には同じ形の固定 RPS 制限は明記されていないため、polite pool 用の識別情報を付け、キャッシュし、rate limit や一時過負荷の応答に対して backoff します。
 - Crossref では general works に加えて journal、funder、type ごとの works 取得も利用できます。
