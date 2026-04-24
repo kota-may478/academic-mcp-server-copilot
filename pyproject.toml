@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "academic-mcp-server"
+version = "0.1.0"
+description = "Production-ready stdio MCP server for academic paper search across Semantic Scholar, arXiv, and Crossref."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp[cli]>=1.27.0",
+  "httpx>=0.28.1",
+  "feedparser>=6.0.12",
+]
+
+[project.scripts]
+academic-mcp-server = "academic_mcp_server.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
