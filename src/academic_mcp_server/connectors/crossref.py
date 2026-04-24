@@ -7,7 +7,7 @@ import httpx
 
 from academic_mcp_server.common.cache import TTLCache
 from academic_mcp_server.common.config import AppConfig
-from academic_mcp_server.common.models import Paper, PaperSearchResponse
+from academic_mcp_server.common.models import Paper, PaperCollectionResponse, PaperSearchResponse
 from academic_mcp_server.common.normalize import normalize_crossref_work, normalize_limit
 
 
@@ -15,14 +15,15 @@ class CrossrefConnector:
     """Async client for Crossref REST API."""
 
     _SELECT_FIELDS = (
-        "DOI,title,author,published-print,published-online,issued,created,"
-        "container-title,abstract,URL,is-referenced-by-count,subject"
+        "DOI,title,author,published-print,published-online,issued,created,indexed,deposited,"
+        "container-title,abstract,URL,is-referenced-by-count,subject,publisher,type,"
+        "license,link,relation,funder,ISSN"
     )
 
     def __init__(self, config: AppConfig) -> None:
         self._default_limit = config.default_limit
         self._contact_email = config.contact_email
-        self._cache: TTLCache[PaperSearchResponse | Paper] = TTLCache(config.cache_ttl_seconds)
+        self._cache: TTLCache[Any] = TTLCache(config.cache_ttl_seconds)
         self._client = httpx.AsyncClient(
             base_url="https://api.crossref.org",
             headers=config.crossref_headers,
@@ -84,6 +85,91 @@ class CrossrefConnector:
         self._cache.set(cache_key, result)
         return result
 
+    async def get_journal_works(
+        self,
+        issn: str,
+        *,
+        limit: int | None = None,
+        query: str | None = None,
+    ) -> PaperCollectionResponse:
+        normalized_issn = self._normalize_identifier(issn, label="issn")
+        return await self._search_collection(
+            path=f"/journals/{quote(normalized_issn, safe='')}/works",
+            kind="journal_works",
+            identifier=normalized_issn,
+            limit=limit,
+            query=query,
+        )
+
+    async def get_funder_works(
+        self,
+        funder_id: str,
+        *,
+        limit: int | None = None,
+        query: str | None = None,
+    ) -> PaperCollectionResponse:
+        normalized_funder_id = self._normalize_identifier(funder_id, label="funder_id")
+        return await self._search_collection(
+            path=f"/funders/{quote(normalized_funder_id, safe='')}/works",
+            kind="funder_works",
+            identifier=normalized_funder_id,
+            limit=limit,
+            query=query,
+        )
+
+    async def get_type_works(
+        self,
+        type_id: str,
+        *,
+        limit: int | None = None,
+        query: str | None = None,
+    ) -> PaperCollectionResponse:
+        normalized_type_id = self._normalize_identifier(type_id, label="type_id")
+        return await self._search_collection(
+            path=f"/types/{quote(normalized_type_id, safe='')}/works",
+            kind="type_works",
+            identifier=normalized_type_id,
+            limit=limit,
+            query=query,
+        )
+
+    async def _search_collection(
+        self,
+        *,
+        path: str,
+        kind: str,
+        identifier: str,
+        limit: int | None,
+        query: str | None,
+    ) -> PaperCollectionResponse:
+        normalized_limit = normalize_limit(limit, default=self._default_limit, maximum=20)
+        normalized_query = query.strip() if query else None
+        cache_key = f"{kind}:{identifier}:{normalized_query or ''}:{normalized_limit}"
+        cached = self._cache.get(cache_key)
+        if isinstance(cached, PaperCollectionResponse):
+            return cached
+
+        params: dict[str, Any] = {
+            "rows": normalized_limit,
+            "select": self._SELECT_FIELDS,
+            "mailto": self._contact_email,
+        }
+        if normalized_query:
+            params["query"] = normalized_query
+
+        message = await self._get_message(path, params=params)
+        result = PaperCollectionResponse(
+            source="crossref",
+            kind=kind,
+            query=normalized_query,
+            identifier=identifier,
+            limit=normalized_limit,
+            total=message.get("total-results"),
+            items=[normalize_crossref_work(item) for item in message.get("items") or []],
+        )
+        self._cache.set(cache_key, result)
+        return result
+
     async def _get_message(self, path: str, *, params: dict[str, Any]) -> dict[str, Any]:
         try:
             response = await self._client.get(path, params=params)
@@ -115,3 +201,10 @@ class CrossrefConnector:
         if detail:
             return f"{base_message} {detail}"
         return base_message
+
+    @staticmethod
+    def _normalize_identifier(identifier: str, *, label: str) -> str:
+        normalized_identifier = identifier.strip()
+        if not normalized_identifier:
+            raise ValueError(f"{label} must not be empty.")
+        return normalized_identifier

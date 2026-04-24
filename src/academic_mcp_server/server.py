@@ -49,8 +49,9 @@ mcp = FastMCP(
     name="academicPaperSearch",
     instructions=(
         "Search academic papers across Semantic Scholar, arXiv, and Crossref. "
-        "Use the source-specific tools when you need provider-specific behavior, "
-        "or use search_papers for a normalized multi-source search."
+        "Use search_papers for quick normalized cross-source discovery, then use the "
+        "source-specific tools for exact paper lookup, citations, references, author "
+        "profiles, recommendations, and Crossref journal, funder, or type slices."
     ),
     lifespan=server_lifespan,
     log_level="INFO",
@@ -66,6 +67,12 @@ def _get_runtime(ctx: Context) -> ServerRuntime:
     if not isinstance(runtime, ServerRuntime):
         raise RuntimeError("Server runtime is unavailable.")
     return runtime
+
+
+def _require_context(ctx: Context | None) -> Context:
+    if ctx is None:
+        raise RuntimeError("Tool context is unavailable.")
+    return ctx
 
 
 def _normalize_sources(sources: list[str] | None) -> list[PaperSource]:
@@ -84,11 +91,19 @@ def _normalize_sources(sources: list[str] | None) -> list[PaperSource]:
     return normalized_sources
 
 
+def _normalize_recommendation_pool(pool: str) -> str:
+    normalized_pool = pool.strip().lower()
+    if normalized_pool not in {"recent", "all-cs"}:
+        raise ValueError("pool must be either 'recent' or 'all-cs'.")
+    return normalized_pool
+
+
 @mcp.tool(
     name="semantic_scholar_search",
     description="Search Semantic Scholar papers by keyword query.",
 )
-async def semantic_scholar_search(query: str, limit: int = 10, ctx: Context = None) -> dict[str, Any]:
+async def semantic_scholar_search(query: str, limit: int = 10, ctx: Context | None = None) -> dict[str, Any]:
+    ctx = _require_context(ctx)
     runtime = _get_runtime(ctx)
     ctx.info("Semantic Scholar search", query=query, limit=limit)
     result = await runtime.semantic_scholar.search(query=query, limit=limit)
@@ -99,7 +114,8 @@ async def semantic_scholar_search(query: str, limit: int = 10, ctx: Context = No
     name="semantic_scholar_paper",
     description="Fetch a single Semantic Scholar paper by paper ID, DOI, or other supported identifier.",
 )
-async def semantic_scholar_paper(paper_id: str, ctx: Context = None) -> dict[str, Any]:
+async def semantic_scholar_paper(paper_id: str, ctx: Context | None = None) -> dict[str, Any]:
+    ctx = _require_context(ctx)
     runtime = _get_runtime(ctx)
     ctx.info("Semantic Scholar paper lookup", paper_id=paper_id)
     result = await runtime.semantic_scholar.get_paper(paper_id=paper_id)
@@ -107,10 +123,175 @@ async def semantic_scholar_paper(paper_id: str, ctx: Context = None) -> dict[str
 
 
 @mcp.tool(
+    name="semantic_scholar_paper_batch",
+    description="Fetch multiple Semantic Scholar papers in one batch by paper IDs, DOI IDs, or other supported identifiers.",
+)
+async def semantic_scholar_paper_batch(
+    paper_ids: list[str],
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    ctx.info("Semantic Scholar paper batch lookup", count=len(paper_ids))
+    result = await runtime.semantic_scholar.get_papers_batch(paper_ids=paper_ids)
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
+    name="semantic_scholar_citations",
+    description="Fetch papers that cite a Semantic Scholar paper.",
+)
+async def semantic_scholar_citations(
+    paper_id: str,
+    limit: int = 10,
+    offset: int = 0,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    ctx.info("Semantic Scholar citations lookup", paper_id=paper_id, limit=limit, offset=offset)
+    result = await runtime.semantic_scholar.get_citations(
+        paper_id=paper_id,
+        limit=limit,
+        offset=offset,
+    )
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
+    name="semantic_scholar_references",
+    description="Fetch papers referenced by a Semantic Scholar paper.",
+)
+async def semantic_scholar_references(
+    paper_id: str,
+    limit: int = 10,
+    offset: int = 0,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    ctx.info("Semantic Scholar references lookup", paper_id=paper_id, limit=limit, offset=offset)
+    result = await runtime.semantic_scholar.get_references(
+        paper_id=paper_id,
+        limit=limit,
+        offset=offset,
+    )
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
+    name="semantic_scholar_author_search",
+    description="Search Semantic Scholar authors by name.",
+)
+async def semantic_scholar_author_search(
+    query: str,
+    limit: int = 10,
+    offset: int = 0,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    ctx.info("Semantic Scholar author search", query=query, limit=limit, offset=offset)
+    result = await runtime.semantic_scholar.search_authors(
+        query=query,
+        limit=limit,
+        offset=offset,
+    )
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
+    name="semantic_scholar_author",
+    description="Fetch a single Semantic Scholar author by author ID.",
+)
+async def semantic_scholar_author(author_id: str, ctx: Context | None = None) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    ctx.info("Semantic Scholar author lookup", author_id=author_id)
+    result = await runtime.semantic_scholar.get_author(author_id=author_id)
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
+    name="semantic_scholar_author_papers",
+    description="Fetch papers for a Semantic Scholar author.",
+)
+async def semantic_scholar_author_papers(
+    author_id: str,
+    limit: int = 10,
+    offset: int = 0,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    ctx.info("Semantic Scholar author papers lookup", author_id=author_id, limit=limit, offset=offset)
+    result = await runtime.semantic_scholar.get_author_papers(
+        author_id=author_id,
+        limit=limit,
+        offset=offset,
+    )
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
+    name="semantic_scholar_recommended_papers",
+    description="Fetch recommended papers for a single Semantic Scholar paper.",
+)
+async def semantic_scholar_recommended_papers(
+    paper_id: str,
+    limit: int = 10,
+    pool: str = "recent",
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    normalized_pool = _normalize_recommendation_pool(pool)
+    ctx.info(
+        "Semantic Scholar recommended papers lookup",
+        paper_id=paper_id,
+        limit=limit,
+        pool=normalized_pool,
+    )
+    result = await runtime.semantic_scholar.get_recommended_papers(
+        paper_id=paper_id,
+        limit=limit,
+        pool=normalized_pool,
+    )
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
+    name="semantic_scholar_recommend_from_examples",
+    description="Fetch Semantic Scholar recommendations from positive and optional negative example papers.",
+)
+async def semantic_scholar_recommend_from_examples(
+    positive_paper_ids: list[str],
+    negative_paper_ids: list[str] | None = None,
+    limit: int = 10,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    ctx.info(
+        "Semantic Scholar example-based recommendations lookup",
+        positive_count=len(positive_paper_ids),
+        negative_count=len(negative_paper_ids or []),
+        limit=limit,
+    )
+    result = await runtime.semantic_scholar.recommend_from_examples(
+        positive_paper_ids=positive_paper_ids,
+        negative_paper_ids=negative_paper_ids,
+        limit=limit,
+    )
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
     name="arxiv_search",
     description="Search arXiv papers and preprints through the Atom query API.",
 )
-async def arxiv_search(query: str, limit: int = 10, ctx: Context = None) -> dict[str, Any]:
+async def arxiv_search(query: str, limit: int = 10, ctx: Context | None = None) -> dict[str, Any]:
+    ctx = _require_context(ctx)
     runtime = _get_runtime(ctx)
     ctx.info("arXiv search", query=query, limit=limit)
     result = await runtime.arxiv.search(query=query, limit=limit)
@@ -118,10 +299,23 @@ async def arxiv_search(query: str, limit: int = 10, ctx: Context = None) -> dict
 
 
 @mcp.tool(
+    name="arxiv_paper",
+    description="Fetch a single arXiv paper by arXiv ID or arXiv URL.",
+)
+async def arxiv_paper(arxiv_id: str, ctx: Context | None = None) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    ctx.info("arXiv paper lookup", arxiv_id=arxiv_id)
+    result = await runtime.arxiv.get_paper(arxiv_id=arxiv_id)
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
     name="crossref_search_works",
     description="Search Crossref works metadata by free-text query.",
 )
-async def crossref_search_works(query: str, limit: int = 10, ctx: Context = None) -> dict[str, Any]:
+async def crossref_search_works(query: str, limit: int = 10, ctx: Context | None = None) -> dict[str, Any]:
+    ctx = _require_context(ctx)
     runtime = _get_runtime(ctx)
     ctx.info("Crossref works search", query=query, limit=limit)
     result = await runtime.crossref.search_works(query=query, limit=limit)
@@ -132,10 +326,74 @@ async def crossref_search_works(query: str, limit: int = 10, ctx: Context = None
     name="crossref_work_by_doi",
     description="Fetch one Crossref work by DOI.",
 )
-async def crossref_work_by_doi(doi: str, ctx: Context = None) -> dict[str, Any]:
+async def crossref_work_by_doi(doi: str, ctx: Context | None = None) -> dict[str, Any]:
+    ctx = _require_context(ctx)
     runtime = _get_runtime(ctx)
     ctx.info("Crossref DOI lookup", doi=doi)
     result = await runtime.crossref.get_work_by_doi(doi=doi)
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
+    name="crossref_journal_works",
+    description="Fetch Crossref works for a journal ISSN, optionally narrowed by a query string.",
+)
+async def crossref_journal_works(
+    issn: str,
+    query: str | None = None,
+    limit: int = 10,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    ctx.info("Crossref journal works lookup", issn=issn, query=query, limit=limit)
+    result = await runtime.crossref.get_journal_works(
+        issn=issn,
+        query=query,
+        limit=limit,
+    )
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
+    name="crossref_funder_works",
+    description="Fetch Crossref works for a funder ID, optionally narrowed by a query string.",
+)
+async def crossref_funder_works(
+    funder_id: str,
+    query: str | None = None,
+    limit: int = 10,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    ctx.info("Crossref funder works lookup", funder_id=funder_id, query=query, limit=limit)
+    result = await runtime.crossref.get_funder_works(
+        funder_id=funder_id,
+        query=query,
+        limit=limit,
+    )
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
+    name="crossref_type_works",
+    description="Fetch Crossref works for a Crossref work type, optionally narrowed by a query string.",
+)
+async def crossref_type_works(
+    type_id: str,
+    query: str | None = None,
+    limit: int = 10,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    ctx.info("Crossref type works lookup", type_id=type_id, query=query, limit=limit)
+    result = await runtime.crossref.get_type_works(
+        type_id=type_id,
+        query=query,
+        limit=limit,
+    )
     return result.model_dump(mode="json")
 
 
@@ -147,8 +405,9 @@ async def search_papers(
     query: str,
     sources: list[str] | None = None,
     limit_per_source: int = 5,
-    ctx: Context = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
+    ctx = _require_context(ctx)
     runtime = _get_runtime(ctx)
     selected_sources = _normalize_sources(sources)
     normalized_limit = normalize_limit(

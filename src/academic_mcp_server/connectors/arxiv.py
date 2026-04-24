@@ -9,7 +9,7 @@ import httpx
 
 from academic_mcp_server.common.cache import TTLCache
 from academic_mcp_server.common.config import AppConfig
-from academic_mcp_server.common.models import PaperSearchResponse
+from academic_mcp_server.common.models import Paper, PaperSearchResponse
 from academic_mcp_server.common.normalize import coerce_int, normalize_arxiv_entry, normalize_limit
 
 
@@ -18,7 +18,7 @@ class ArxivConnector:
 
     def __init__(self, config: AppConfig) -> None:
         self._default_limit = config.default_limit
-        self._cache: TTLCache[PaperSearchResponse] = TTLCache(config.cache_ttl_seconds)
+        self._cache: TTLCache[Any] = TTLCache(config.cache_ttl_seconds)
         self._client = httpx.AsyncClient(
             base_url="https://export.arxiv.org",
             headers={"Accept": "application/atom+xml"},
@@ -63,6 +63,21 @@ class ArxivConnector:
         self._cache.set(cache_key, result)
         return result
 
+    async def get_paper(self, arxiv_id: str) -> Paper:
+        normalized_identifier = self._normalize_identifier(arxiv_id)
+        cache_key = f"paper:{normalized_identifier}"
+        cached = self._cache.get(cache_key)
+        if isinstance(cached, Paper):
+            return cached
+
+        feed = await self._get_feed(params={"id_list": normalized_identifier})
+        if not feed.entries:
+            raise RuntimeError(f"arXiv paper '{normalized_identifier}' was not found.")
+
+        result = normalize_arxiv_entry(feed.entries[0])
+        self._cache.set(cache_key, result)
+        return result
+
     async def _get_feed(self, *, params: dict[str, Any]) -> feedparser.FeedParserDict:
         async with self._request_lock:
             wait_seconds = self._minimum_interval_seconds - (
@@ -90,3 +105,19 @@ class ArxivConnector:
                 raise RuntimeError(f"arXiv feed parsing failed: {bozo_exception}")
 
         return feed
+
+    @staticmethod
+    def _normalize_identifier(arxiv_id: str) -> str:
+        normalized_identifier = arxiv_id.strip()
+        if not normalized_identifier:
+            raise ValueError("arxiv_id must not be empty.")
+
+        lowered = normalized_identifier.lower()
+        if lowered.startswith("arxiv:"):
+            return normalized_identifier.split(":", 1)[1]
+        if "/abs/" in lowered:
+            return normalized_identifier.rsplit("/", 1)[-1]
+        if "/pdf/" in lowered:
+            return normalized_identifier.rsplit("/", 1)[-1].removesuffix(".pdf")
+
+        return normalized_identifier
