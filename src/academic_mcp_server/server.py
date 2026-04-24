@@ -51,7 +51,8 @@ mcp = FastMCP(
         "Search academic papers across Semantic Scholar, arXiv, and Crossref. "
         "Use search_papers for quick normalized cross-source discovery, then use the "
         "source-specific tools for exact paper lookup, citations, references, author "
-        "profiles, recommendations, and Crossref journal, funder, or type slices."
+        "profiles, recommendations, arXiv full-text analysis, and Crossref journal, "
+        "funder, or type slices."
     ),
     lifespan=server_lifespan,
     log_level="INFO",
@@ -307,6 +308,36 @@ async def arxiv_paper(arxiv_id: str, ctx: Context | None = None) -> dict[str, An
     runtime = _get_runtime(ctx)
     ctx.info("arXiv paper lookup", arxiv_id=arxiv_id)
     result = await runtime.arxiv.get_paper(arxiv_id=arxiv_id)
+    return result.model_dump(mode="json")
+
+
+@mcp.tool(
+    name="arxiv_full_text",
+    description=(
+        "Download and analyze an arXiv paper's full text from source files or PDF. "
+        "When source files are available, also extract figure and table captions. "
+        "Set max_characters=0 to disable truncation."
+    ),
+)
+async def arxiv_full_text(
+    arxiv_id: str,
+    prefer: str = "source",
+    max_characters: int = 200000,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    ctx.info(
+        "arXiv full text analysis",
+        arxiv_id=arxiv_id,
+        prefer=prefer,
+        max_characters=max_characters,
+    )
+    result = await runtime.arxiv.analyze_full_text(
+        arxiv_id=arxiv_id,
+        prefer=prefer,
+        max_characters=max_characters,
+    )
     return result.model_dump(mode="json")
 
 

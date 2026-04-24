@@ -42,6 +42,33 @@ class Paper(BaseModel):
     source_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class DocumentArtifact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["figure", "table"]
+    label: str | None = None
+    caption: str | None = None
+    source_path: str | None = None
+    referenced_files: list[str] = Field(default_factory=list)
+
+
+class ArxivFullTextResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["arxiv"]
+    source_id: str
+    extraction_method: Literal["source", "pdf"]
+    content_url: str | None = None
+    paper: Paper
+    full_text: str
+    full_text_char_count: int
+    full_text_truncated: bool = False
+    figure_items: list[DocumentArtifact] = Field(default_factory=list)
+    table_items: list[DocumentArtifact] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    extraction_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class Author(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

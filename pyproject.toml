@@ -12,6 +12,7 @@ dependencies = [
   "mcp[cli]>=1.27.0",
   "httpx>=0.28.1",
   "feedparser>=6.0.12",
+  "pypdf>=5.4.0",
 ]
 
 [project.scripts]
