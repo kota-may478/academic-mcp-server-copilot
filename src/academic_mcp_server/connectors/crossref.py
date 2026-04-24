@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -24,6 +27,7 @@ class CrossrefConnector:
         self._default_limit = config.default_limit
         self._contact_email = config.contact_email
         self._cache: TTLCache[Any] = TTLCache(config.cache_ttl_seconds)
+        self._retryable_status_codes = {429, 503}
         self._client = httpx.AsyncClient(
             base_url="https://api.crossref.org",
             headers=config.crossref_headers,
@@ -171,16 +175,32 @@ class CrossrefConnector:
         return result
 
     async def _get_message(self, path: str, *, params: dict[str, Any]) -> dict[str, Any]:
-        try:
-            response = await self._client.get(path, params=params)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise RuntimeError(self._format_http_error(exc)) from exc
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"Crossref request failed: {exc}") from exc
+        backoff_seconds = 1.0
+        for attempt in range(3):
+            try:
+                response = await self._client.get(path, params=params)
+                response.raise_for_status()
+                payload = response.json()
+                return payload.get("message") or {}
+            except httpx.HTTPStatusError as exc:
+                if (
+                    exc.response.status_code in self._retryable_status_codes
+                    and attempt < 2
+                ):
+                    await asyncio.sleep(
+                        self._get_retry_delay_seconds(
+                            exc.response,
+                            default_seconds=backoff_seconds,
+                        )
+                    )
+                    backoff_seconds *= 2
+                    continue
 
-        payload = response.json()
-        return payload.get("message") or {}
+                raise RuntimeError(self._format_http_error(exc)) from exc
+            except httpx.HTTPError as exc:
+                raise RuntimeError(f"Crossref request failed: {exc}") from exc
+
+        raise RuntimeError("Crossref request retry loop exited unexpectedly.")
 
     @staticmethod
     def _format_http_error(exc: httpx.HTTPStatusError) -> str:
@@ -201,6 +221,33 @@ class CrossrefConnector:
         if detail:
             return f"{base_message} {detail}"
         return base_message
+
+    @staticmethod
+    def _get_retry_delay_seconds(
+        response: httpx.Response,
+        *,
+        default_seconds: float,
+    ) -> float:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after is None:
+            return default_seconds
+
+        normalized_retry_after = retry_after.strip()
+        if normalized_retry_after.isdigit():
+            return max(float(normalized_retry_after), 0.0)
+
+        try:
+            retry_at = parsedate_to_datetime(normalized_retry_after)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return default_seconds
+
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+
+        return max(
+            (retry_at - datetime.now(timezone.utc)).total_seconds(),
+            0.0,
+        )
 
     @staticmethod
     def _normalize_identifier(identifier: str, *, label: str) -> str:

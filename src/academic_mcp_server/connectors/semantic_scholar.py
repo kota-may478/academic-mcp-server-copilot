@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -28,6 +30,9 @@ class SemanticScholarConnector:
     def __init__(self, config: AppConfig) -> None:
         self._default_limit = config.default_limit
         self._cache: TTLCache[Any] = TTLCache(config.cache_ttl_seconds)
+        self._request_lock = asyncio.Lock()
+        self._last_request_started_at = 0.0
+        self._minimum_interval_seconds = 1.0
         self._graph_client = httpx.AsyncClient(
             base_url="https://api.semanticscholar.org/graph/v1",
             headers=config.semantic_scholar_headers,
@@ -397,15 +402,16 @@ class SemanticScholarConnector:
         *,
         params: dict[str, Any],
     ) -> dict[str, Any]:
-        try:
-            response = await client.get(path, params=params)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise RuntimeError(self._format_http_error(exc)) from exc
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"Semantic Scholar request failed: {exc}") from exc
+        payload = await self._request_json(
+            client,
+            "GET",
+            path,
+            params=params,
+        )
+        if not isinstance(payload, dict):
+            raise RuntimeError("Semantic Scholar returned an unexpected response payload.")
 
-        return response.json()
+        return payload
 
     async def _post_json(
         self,
@@ -415,13 +421,46 @@ class SemanticScholarConnector:
         params: dict[str, Any],
         json_body: dict[str, Any],
     ) -> Any:
-        try:
-            response = await client.post(path, params=params, json=json_body)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise RuntimeError(self._format_http_error(exc)) from exc
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"Semantic Scholar request failed: {exc}") from exc
+        return await self._request_json(
+            client,
+            "POST",
+            path,
+            params=params,
+            json_body=json_body,
+        )
+
+    async def _request_json(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any],
+        json_body: dict[str, Any] | None = None,
+    ) -> Any:
+        # Semantic Scholar applies 1 RPS cumulatively across endpoints for API-key traffic,
+        # so Graph and Recommendations requests share the same serialized gate.
+        async with self._request_lock:
+            wait_seconds = self._minimum_interval_seconds - (
+                time.monotonic() - self._last_request_started_at
+            )
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+
+            self._last_request_started_at = time.monotonic()
+
+            try:
+                response = await client.request(
+                    method,
+                    path,
+                    params=params,
+                    json=json_body,
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(self._format_http_error(exc)) from exc
+            except httpx.HTTPError as exc:
+                raise RuntimeError(f"Semantic Scholar request failed: {exc}") from exc
 
         return response.json()
 
