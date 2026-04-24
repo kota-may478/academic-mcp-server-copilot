@@ -10,9 +10,12 @@ from typing import Any, AsyncIterator, cast
 from mcp.server.fastmcp import Context, FastMCP
 
 from academic_mcp_server.common.config import AppConfig
-from academic_mcp_server.common.models import SUPPORTED_SOURCES, PaperSource, SourceError, UnifiedSearchResponse
+from academic_mcp_server.common.models import Paper, PaperCollectionResponse, SUPPORTED_SOURCES, PaperSource, SourceError, UnifiedSearchResponse
 from academic_mcp_server.common.normalize import normalize_limit, sort_papers_for_display
 from academic_mcp_server.connectors import ArxivConnector, CrossrefConnector, SemanticScholarConnector
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -33,6 +36,13 @@ class ServerRuntime:
 @asynccontextmanager
 async def server_lifespan(_: FastMCP) -> AsyncIterator[ServerRuntime]:
     config = AppConfig.from_env()
+    config_state_message = (
+        "Starting academicPaperSearch with config state: "
+        f"semantic_scholar_api_key={'present' if config.semantic_scholar_api_key else 'absent'}, "
+        f"contact_email={'present' if config.contact_email else 'absent'}"
+    )
+    LOGGER.info(config_state_message)
+    print(config_state_message, file=sys.stderr, flush=True)
     runtime = ServerRuntime(
         config=config,
         semantic_scholar=SemanticScholarConnector(config),
@@ -97,6 +107,57 @@ def _normalize_recommendation_pool(pool: str) -> str:
     if normalized_pool not in {"recent", "all-cs"}:
         raise ValueError("pool must be either 'recent' or 'all-cs'.")
     return normalized_pool
+
+
+def _should_fallback_to_crossref_references(paper: Paper) -> bool:
+    return bool(paper.doi and (paper.reference_count or 0) > 0)
+
+
+async def _get_semantic_scholar_references_with_fallback(
+    runtime: ServerRuntime,
+    *,
+    paper_id: str,
+    limit: int,
+    offset: int,
+    ctx: Context,
+) -> PaperCollectionResponse:
+    result = await runtime.semantic_scholar.get_references(
+        paper_id=paper_id,
+        limit=limit,
+        offset=offset,
+    )
+    if result.items:
+        return result
+
+    paper = await runtime.semantic_scholar.get_paper(paper_id=paper_id)
+    if not _should_fallback_to_crossref_references(paper):
+        return result
+
+    fallback = await runtime.crossref.get_work_references(
+        doi=paper.doi,
+        limit=limit,
+        offset=offset,
+    )
+    if not fallback.items:
+        return result
+
+    ctx.info(
+        "Crossref fallback for Semantic Scholar references",
+        paper_id=paper.source_id,
+        doi=paper.doi,
+        semantic_scholar_reference_count=paper.reference_count,
+        fallback_items=len(fallback.items),
+    )
+    return PaperCollectionResponse(
+        source="semantic_scholar",
+        kind="references",
+        identifier=result.identifier or paper.source_id,
+        limit=result.limit,
+        offset=result.offset,
+        next_offset=fallback.next_offset,
+        total=fallback.total or paper.reference_count,
+        items=fallback.items,
+    )
 
 
 @mcp.tool(
@@ -172,10 +233,12 @@ async def semantic_scholar_references(
     ctx = _require_context(ctx)
     runtime = _get_runtime(ctx)
     ctx.info("Semantic Scholar references lookup", paper_id=paper_id, limit=limit, offset=offset)
-    result = await runtime.semantic_scholar.get_references(
+    result = await _get_semantic_scholar_references_with_fallback(
+        runtime,
         paper_id=paper_id,
         limit=limit,
         offset=offset,
+        ctx=ctx,
     )
     return result.model_dump(mode="json")
 

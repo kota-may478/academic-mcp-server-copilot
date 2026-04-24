@@ -236,6 +236,9 @@ def normalize_semantic_scholar_paper(
     text_availability = normalize_text(raw_paper.get("textAvailability"))
     if text_availability:
         source_metadata["text_availability"] = text_availability
+    open_access_disclaimer = normalize_text((raw_paper.get("openAccessPdf") or {}).get("disclaimer"))
+    if open_access_disclaimer:
+        source_metadata["open_access_disclaimer"] = open_access_disclaimer
 
     if extra_metadata:
         for key, value in extra_metadata.items():
@@ -392,6 +395,49 @@ def normalize_crossref_author(raw_author: dict[str, Any]) -> Author:
         affiliations=affiliations,
         orcid=orcid,
         external_ids=external_ids,
+    )
+
+
+def normalize_crossref_reference(raw_reference: dict[str, Any]) -> Paper:
+    doi = normalize_text(raw_reference.get("DOI"))
+    title = (
+        normalize_text(raw_reference.get("article-title"))
+        or normalize_text(raw_reference.get("volume-title"))
+        or normalize_text(raw_reference.get("series-title"))
+        or normalize_text(raw_reference.get("unstructured"))
+        or doi
+        or "Untitled"
+    )
+    author = normalize_text(raw_reference.get("author"))
+    journal_title = normalize_text(raw_reference.get("journal-title"))
+    source_metadata = {
+        key: value
+        for key, value in {
+            "crossref_reference_key": normalize_text(raw_reference.get("key")),
+            "journal_title": journal_title,
+            "series_title": normalize_text(raw_reference.get("series-title")),
+            "volume_title": normalize_text(raw_reference.get("volume-title")),
+            "first_page": normalize_text(raw_reference.get("first-page")),
+            "doi_asserted_by": normalize_text(raw_reference.get("doi-asserted-by")),
+            "unstructured": normalize_text(raw_reference.get("unstructured")),
+        }.items()
+        if value
+    }
+    external_ids: dict[str, str] = {}
+    if doi:
+        external_ids["DOI"] = doi
+
+    return Paper(
+        source="crossref",
+        source_id=doi or normalize_text(raw_reference.get("key")) or title,
+        title=title,
+        authors=[author] if author else [],
+        published=year_to_iso(raw_reference.get("year")),
+        doi=doi,
+        venue=journal_title,
+        url=f"https://doi.org/{doi}" if doi else None,
+        external_ids=external_ids,
+        source_metadata=source_metadata,
     )
 
 

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import random
+import re
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -13,8 +18,13 @@ from academic_mcp_server.common.models import Author, AuthorCollectionResponse, 
 from academic_mcp_server.common.normalize import normalize_limit, normalize_offset, normalize_semantic_scholar_author, normalize_semantic_scholar_paper
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 class SemanticScholarConnector:
     """Async client for Semantic Scholar Graph API."""
+
+    _SEMANTIC_SCHOLAR_PAPER_ID_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 
     _PAPER_FIELDS = (
         "paperId,corpusId,title,abstract,authors,year,publicationDate,venue,url,"
@@ -22,10 +32,17 @@ class SemanticScholarConnector:
         "openAccessPdf,fieldsOfStudy,s2FieldsOfStudy,publicationTypes,publicationVenue,"
         "journal,tldr,textAvailability"
     )
+    _RECOMMENDATION_FIELDS = (
+        "paperId,corpusId,title,abstract,authors,year,publicationDate,venue,url,"
+        "externalIds,citationCount,referenceCount,influentialCitationCount,isOpenAccess,"
+        "openAccessPdf,fieldsOfStudy,s2FieldsOfStudy,publicationTypes,publicationVenue,"
+        "journal"
+    )
+    _RELATION_PAPER_FIELDS = _RECOMMENDATION_FIELDS
     _AUTHOR_FIELDS = (
         "name,url,homepage,affiliations,paperCount,citationCount,hIndex,externalIds"
     )
-    _RELATION_FIELDS = f"contexts,intents,isInfluential,{_PAPER_FIELDS}"
+    _RELATION_FIELDS = f"contexts,intents,isInfluential,{_RELATION_PAPER_FIELDS}"
 
     def __init__(self, config: AppConfig) -> None:
         self._default_limit = config.default_limit
@@ -33,6 +50,10 @@ class SemanticScholarConnector:
         self._request_lock = asyncio.Lock()
         self._last_request_started_at = 0.0
         self._minimum_interval_seconds = 1.0
+        self._jitter_max_seconds = 0.5
+        self._initial_retry_delay_seconds = 2.0
+        self._max_retry_delay_seconds = 30.0
+        self._max_retry_attempts = 5
         self._graph_client = httpx.AsyncClient(
             base_url="https://api.semanticscholar.org/graph/v1",
             headers=config.semantic_scholar_headers,
@@ -79,6 +100,7 @@ class SemanticScholarConnector:
                 for item in payload.get("data") or []
             ],
         )
+        self._cache_papers(result.items)
         self._cache.set(cache_key, result)
         return result
 
@@ -118,6 +140,7 @@ class SemanticScholarConnector:
             total=len(payload),
             items=[normalize_semantic_scholar_paper(item) for item in payload if isinstance(item, dict)],
         )
+        self._cache_papers(result.items)
         self._cache.set(cache_key, result)
         return result
 
@@ -249,6 +272,7 @@ class SemanticScholarConnector:
                 for item in payload.get("data") or []
             ],
         )
+        self._cache_papers(result.items)
         self._cache.set(cache_key, result)
         return result
 
@@ -259,7 +283,7 @@ class SemanticScholarConnector:
         limit: int | None = None,
         pool: str = "recent",
     ) -> PaperCollectionResponse:
-        normalized_identifier = self._normalize_identifier(paper_id)
+        normalized_identifier = await self._resolve_relation_identifier(paper_id)
         normalized_limit = normalize_limit(limit, default=self._default_limit, maximum=100)
         normalized_pool = self._normalize_recommendation_pool(pool)
         cache_key = f"recommendations:{normalized_identifier}:{normalized_pool}:{normalized_limit}"
@@ -273,7 +297,7 @@ class SemanticScholarConnector:
             params={
                 "from": normalized_pool,
                 "limit": normalized_limit,
-                "fields": self._PAPER_FIELDS,
+                "fields": self._RECOMMENDATION_FIELDS,
             },
         )
         result = PaperCollectionResponse(
@@ -286,6 +310,7 @@ class SemanticScholarConnector:
                 for item in payload.get("recommendedPapers") or []
             ],
         )
+        self._cache_papers(result.items)
         self._cache.set(cache_key, result)
         return result
 
@@ -319,7 +344,7 @@ class SemanticScholarConnector:
             "/papers/",
             params={
                 "limit": normalized_limit,
-                "fields": self._PAPER_FIELDS,
+                "fields": self._RECOMMENDATION_FIELDS,
             },
             json_body={
                 "positivePaperIds": normalized_positive_ids,
@@ -336,6 +361,7 @@ class SemanticScholarConnector:
                 for item in payload.get("recommendedPapers") or []
             ],
         )
+        self._cache_papers(result.items)
         self._cache.set(cache_key, result)
         return result
 
@@ -349,7 +375,7 @@ class SemanticScholarConnector:
         limit: int | None,
         offset: int | None,
     ) -> PaperCollectionResponse:
-        normalized_identifier = self._normalize_identifier(paper_id)
+        normalized_identifier = await self._resolve_relation_identifier(paper_id)
         normalized_limit = normalize_limit(limit, default=self._default_limit, maximum=100)
         normalized_offset = normalize_offset(offset)
         cache_key = f"{kind}:{normalized_identifier}:{normalized_limit}:{normalized_offset}"
@@ -392,6 +418,7 @@ class SemanticScholarConnector:
             next_offset=payload.get("next"),
             items=items,
         )
+        self._cache_papers(result.items)
         self._cache.set(cache_key, result)
         return result
 
@@ -441,28 +468,122 @@ class SemanticScholarConnector:
         # Semantic Scholar applies 1 RPS cumulatively across endpoints for API-key traffic,
         # so Graph and Recommendations requests share the same serialized gate.
         async with self._request_lock:
-            wait_seconds = self._minimum_interval_seconds - (
-                time.monotonic() - self._last_request_started_at
-            )
-            if wait_seconds > 0:
-                await asyncio.sleep(wait_seconds)
-
-            self._last_request_started_at = time.monotonic()
-
-            try:
-                response = await client.request(
-                    method,
-                    path,
-                    params=params,
-                    json=json_body,
+            for attempt in range(self._max_retry_attempts + 1):
+                wait_seconds = self._minimum_interval_seconds - (
+                    time.monotonic() - self._last_request_started_at
                 )
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                raise RuntimeError(self._format_http_error(exc)) from exc
-            except httpx.HTTPError as exc:
-                raise RuntimeError(f"Semantic Scholar request failed: {exc}") from exc
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds + self._get_jitter_seconds())
 
-        return response.json()
+                self._last_request_started_at = time.monotonic()
+
+                try:
+                    response = await client.request(
+                        method,
+                        path,
+                        params=params,
+                        json=json_body,
+                    )
+                    response.raise_for_status()
+                    return response.json()
+                except httpx.HTTPStatusError as exc:
+                    if self._should_retry(exc.response, attempt):
+                        retry_delay_seconds = self._get_retry_delay_seconds(
+                            exc.response,
+                            attempt,
+                        )
+                        LOGGER.warning(
+                            "Retrying Semantic Scholar request after HTTP %s in %.2fs (%s %s, attempt %s/%s)",
+                            exc.response.status_code,
+                            retry_delay_seconds,
+                            method,
+                            path,
+                            attempt + 1,
+                            self._max_retry_attempts,
+                        )
+                        if retry_delay_seconds > 0:
+                            await asyncio.sleep(retry_delay_seconds)
+                        continue
+                    raise RuntimeError(self._format_http_error(exc)) from exc
+                except httpx.HTTPError as exc:
+                    raise RuntimeError(f"Semantic Scholar request failed: {exc}") from exc
+
+        raise RuntimeError("Semantic Scholar request failed after exhausting retries.")
+
+    async def _resolve_relation_identifier(self, paper_id: str) -> str:
+        normalized_identifier = self._normalize_identifier(paper_id)
+        if self._SEMANTIC_SCHOLAR_PAPER_ID_PATTERN.fullmatch(normalized_identifier):
+            return normalized_identifier
+
+        paper = await self.get_paper(normalized_identifier)
+        resolved_identifier = self._normalize_identifier(paper.source_id)
+        if not self._SEMANTIC_SCHOLAR_PAPER_ID_PATTERN.fullmatch(resolved_identifier):
+            raise RuntimeError(
+                "Semantic Scholar did not return a canonical paperId for relation lookup."
+            )
+        return resolved_identifier
+
+    def _cache_papers(self, papers: list[Paper]) -> None:
+        for paper in papers:
+            if paper.source != "semantic_scholar":
+                continue
+            normalized_identifier = self._normalize_simple_identifier(
+                paper.source_id,
+                label="paper_id",
+            )
+            self._cache.set(f"paper:{normalized_identifier}", paper)
+
+    def _should_retry(self, response: httpx.Response, attempt: int) -> bool:
+        return (
+            response.status_code in {408, 429, 500, 502, 503, 504}
+            and attempt < self._max_retry_attempts
+        )
+
+    def _get_retry_delay_seconds(self, response: httpx.Response, attempt: int) -> float:
+        retry_after_seconds = self._parse_retry_after_seconds(
+            response.headers.get("Retry-After")
+        )
+        if retry_after_seconds is not None:
+            return retry_after_seconds + self._get_jitter_seconds()
+
+        return min(
+            self._max_retry_delay_seconds,
+            self._initial_retry_delay_seconds * float(2**attempt),
+        ) + self._get_jitter_seconds()
+
+    def _get_jitter_seconds(self) -> float:
+        if self._jitter_max_seconds <= 0:
+            return 0.0
+        return random.uniform(0.0, self._jitter_max_seconds)
+
+    @staticmethod
+    def _parse_retry_after_seconds(retry_after_value: str | None) -> float | None:
+        if retry_after_value is None:
+            return None
+
+        normalized_value = retry_after_value.strip()
+        if not normalized_value:
+            return None
+
+        try:
+            return max(float(normalized_value), 0.0)
+        except ValueError:
+            pass
+
+        try:
+            retry_after_datetime = parsedate_to_datetime(normalized_value)
+        except (TypeError, ValueError, IndexError):
+            return None
+
+        if retry_after_datetime is None:
+            return None
+        if retry_after_datetime.tzinfo is None:
+            retry_after_datetime = retry_after_datetime.replace(tzinfo=timezone.utc)
+
+        return max(
+            (retry_after_datetime - datetime.now(timezone.utc)).total_seconds(),
+            0.0,
+        )
 
     @staticmethod
     def _normalize_identifier(paper_id: str) -> str:
@@ -517,6 +638,7 @@ class SemanticScholarConnector:
     def _format_http_error(exc: httpx.HTTPStatusError) -> str:
         response = exc.response
         detail: str | None = None
+        retry_after = response.headers.get("Retry-After")
         try:
             payload = response.json()
             if isinstance(payload, dict):
@@ -525,6 +647,8 @@ class SemanticScholarConnector:
             detail = None
 
         base_message = f"Semantic Scholar returned HTTP {response.status_code}."
+        if retry_after:
+            base_message = f"{base_message} Retry-After: {retry_after}."
         if detail:
             return f"{base_message} {detail}"
         return base_message

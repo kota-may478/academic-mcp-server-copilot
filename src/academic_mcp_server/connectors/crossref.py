@@ -11,7 +11,7 @@ import httpx
 from academic_mcp_server.common.cache import TTLCache
 from academic_mcp_server.common.config import AppConfig
 from academic_mcp_server.common.models import Paper, PaperCollectionResponse, PaperSearchResponse
-from academic_mcp_server.common.normalize import normalize_crossref_work, normalize_limit
+from academic_mcp_server.common.normalize import normalize_crossref_reference, normalize_crossref_work, normalize_limit, normalize_offset
 
 
 class CrossrefConnector:
@@ -22,7 +22,6 @@ class CrossrefConnector:
         "container-title,abstract,URL,is-referenced-by-count,subject,publisher,type,"
         "license,link,relation,funder,ISSN"
     )
-
     def __init__(self, config: AppConfig) -> None:
         self._default_limit = config.default_limit
         self._contact_email = config.contact_email
@@ -86,6 +85,51 @@ class CrossrefConnector:
             params={"mailto": self._contact_email},
         )
         result = normalize_crossref_work(message)
+        self._cache.set(cache_key, result)
+        return result
+
+    async def get_work_references(
+        self,
+        doi: str,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> PaperCollectionResponse:
+        normalized_doi = doi.strip()
+        if not normalized_doi:
+            raise ValueError("doi must not be empty.")
+
+        normalized_limit = normalize_limit(limit, default=self._default_limit, maximum=100)
+        normalized_offset = normalize_offset(offset)
+        cache_key = f"work_references:{normalized_doi.lower()}:{normalized_limit}:{normalized_offset}"
+        cached = self._cache.get(cache_key)
+        if isinstance(cached, PaperCollectionResponse):
+            return cached
+
+        message = await self._get_message(
+            f"/works/{quote(normalized_doi, safe='')}",
+            params={"mailto": self._contact_email},
+        )
+        references = [
+            item for item in (message.get("reference") or []) if isinstance(item, dict)
+        ]
+        paged_references = references[
+            normalized_offset : normalized_offset + normalized_limit
+        ]
+        next_offset = normalized_offset + len(paged_references)
+        if next_offset >= len(references):
+            next_offset = None
+
+        result = PaperCollectionResponse(
+            source="crossref",
+            kind="work_references",
+            identifier=normalized_doi,
+            limit=normalized_limit,
+            offset=normalized_offset,
+            next_offset=next_offset,
+            total=len(references),
+            items=[normalize_crossref_reference(item) for item in paged_references],
+        )
         self._cache.set(cache_key, result)
         return result
 
