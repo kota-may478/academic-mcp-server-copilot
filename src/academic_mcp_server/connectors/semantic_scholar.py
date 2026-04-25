@@ -65,6 +65,8 @@ class SemanticScholarConnector:
             timeout=config.request_timeout_seconds,
         )
 
+    _RELATION_IDENTIFIER_CACHE_PREFIX = "paper_relation_id:"
+
     async def aclose(self) -> None:
         await self._graph_client.aclose()
         await self._recommendations_client.aclose()
@@ -117,7 +119,7 @@ class SemanticScholarConnector:
             params={"fields": self._PAPER_FIELDS},
         )
         result = normalize_semantic_scholar_paper(payload)
-        self._cache.set(cache_key, result)
+        self._cache_paper(result, explicit_aliases=[normalized_identifier])
         return result
 
     async def get_papers_batch(self, paper_ids: list[str]) -> PaperCollectionResponse:
@@ -515,6 +517,15 @@ class SemanticScholarConnector:
         if self._SEMANTIC_SCHOLAR_PAPER_ID_PATTERN.fullmatch(normalized_identifier):
             return normalized_identifier
 
+        cached_relation_identifier = self._cache.get(
+            f"{self._RELATION_IDENTIFIER_CACHE_PREFIX}{normalized_identifier}"
+        )
+        if (
+            isinstance(cached_relation_identifier, str)
+            and self._SEMANTIC_SCHOLAR_PAPER_ID_PATTERN.fullmatch(cached_relation_identifier)
+        ):
+            return cached_relation_identifier
+
         paper = await self.get_paper(normalized_identifier)
         resolved_identifier = self._normalize_identifier(paper.source_id)
         if not self._SEMANTIC_SCHOLAR_PAPER_ID_PATTERN.fullmatch(resolved_identifier):
@@ -527,11 +538,60 @@ class SemanticScholarConnector:
         for paper in papers:
             if paper.source != "semantic_scholar":
                 continue
-            normalized_identifier = self._normalize_simple_identifier(
-                paper.source_id,
-                label="paper_id",
-            )
-            self._cache.set(f"paper:{normalized_identifier}", paper)
+            self._cache_paper(paper)
+
+    def _cache_paper(
+        self,
+        paper: Paper,
+        *,
+        explicit_aliases: list[str] | None = None,
+    ) -> None:
+        canonical_identifier = self._normalize_simple_identifier(
+            paper.source_id,
+            label="paper_id",
+        )
+        relation_identifier = (
+            canonical_identifier
+            if self._SEMANTIC_SCHOLAR_PAPER_ID_PATTERN.fullmatch(canonical_identifier)
+            else None
+        )
+
+        cache_keys = {f"paper:{canonical_identifier}"}
+        for alias in explicit_aliases or []:
+            cache_keys.add(f"paper:{alias}")
+        for alias in self._build_paper_aliases(paper):
+            cache_keys.add(f"paper:{alias}")
+
+        for cache_key in cache_keys:
+            self._cache.set(cache_key, paper)
+            if relation_identifier:
+                alias_identifier = cache_key.removeprefix("paper:")
+                self._cache.set(
+                    f"{self._RELATION_IDENTIFIER_CACHE_PREFIX}{alias_identifier}",
+                    relation_identifier,
+                )
+
+    def _build_paper_aliases(self, paper: Paper) -> set[str]:
+        aliases: set[str] = set()
+        if paper.doi:
+            aliases.add(self._normalize_identifier(paper.doi))
+
+        for external_id_key, raw_external_id in paper.external_ids.items():
+            values = raw_external_id if isinstance(raw_external_id, list) else [raw_external_id]
+            for value in values:
+                normalized_value = self._normalize_simple_identifier(
+                    str(value),
+                    label=f"external_id:{external_id_key}",
+                )
+                normalized_key = external_id_key.strip().lower()
+                if normalized_key == "doi":
+                    aliases.add(self._normalize_identifier(normalized_value))
+                    continue
+                if normalized_key in {"corpusid", "arxiv", "acl", "pmid", "pmcid"}:
+                    aliases.add(f"{external_id_key}:{normalized_value}")
+                    aliases.add(normalized_value)
+        aliases.discard(self._normalize_simple_identifier(paper.source_id, label="paper_id"))
+        return aliases
 
     def _should_retry(self, response: httpx.Response, attempt: int) -> bool:
         return (

@@ -12,7 +12,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from academic_mcp_server.common.config import AppConfig
 from academic_mcp_server.common.models import Paper, PaperCollectionResponse, SUPPORTED_SOURCES, PaperSource, SourceError, UnifiedSearchResponse
 from academic_mcp_server.common.normalize import normalize_limit, sort_papers_for_display
-from academic_mcp_server.connectors import ArxivConnector, CrossrefConnector, SemanticScholarConnector
+from academic_mcp_server.connectors import ArxivConnector, CrossrefConnector, OpenAlexConnector, SemanticScholarConnector
 
 
 LOGGER = logging.getLogger(__name__)
@@ -24,12 +24,14 @@ class ServerRuntime:
     semantic_scholar: SemanticScholarConnector
     arxiv: ArxivConnector
     crossref: CrossrefConnector
+    openalex: OpenAlexConnector
 
     async def aclose(self) -> None:
         await asyncio.gather(
             self.semantic_scholar.aclose(),
             self.arxiv.aclose(),
             self.crossref.aclose(),
+            self.openalex.aclose(),
         )
 
 
@@ -48,6 +50,7 @@ async def server_lifespan(_: FastMCP) -> AsyncIterator[ServerRuntime]:
         semantic_scholar=SemanticScholarConnector(config),
         arxiv=ArxivConnector(config),
         crossref=CrossrefConnector(config),
+        openalex=OpenAlexConnector(config),
     )
     try:
         yield runtime
@@ -113,6 +116,37 @@ def _should_fallback_to_crossref_references(paper: Paper) -> bool:
     return bool(paper.doi and (paper.reference_count or 0) > 0)
 
 
+def _extract_doi_candidate(identifier: str) -> str | None:
+    normalized = identifier.strip()
+    if not normalized:
+        return None
+    if normalized.lower().startswith("https://doi.org/"):
+        normalized = normalized[16:]
+    elif normalized.lower().startswith("http://doi.org/"):
+        normalized = normalized[15:]
+    if "/" not in normalized or " " in normalized:
+        return None
+    return normalized
+
+
+async def _resolve_paper_and_doi(
+    runtime: ServerRuntime,
+    *,
+    paper_id: str,
+) -> tuple[Paper | None, str | None]:
+    doi = _extract_doi_candidate(paper_id)
+    semantic_scholar_paper: Paper | None = None
+    if doi is not None:
+        return None, doi
+
+    try:
+        semantic_scholar_paper = await runtime.semantic_scholar.get_paper(paper_id=paper_id)
+    except Exception:
+        return None, None
+
+    return semantic_scholar_paper, semantic_scholar_paper.doi
+
+
 async def _get_semantic_scholar_references_with_fallback(
     runtime: ServerRuntime,
     *,
@@ -121,6 +155,46 @@ async def _get_semantic_scholar_references_with_fallback(
     offset: int,
     ctx: Context,
 ) -> PaperCollectionResponse:
+    semantic_scholar_paper, doi = await _resolve_paper_and_doi(
+        runtime,
+        paper_id=paper_id,
+    )
+    if doi:
+        try:
+            openalex_result = await runtime.openalex.get_references(
+                identifier=doi,
+                limit=limit,
+                offset=offset,
+            )
+            if openalex_result.items:
+                ctx.info(
+                    "OpenAlex primary provider for Semantic Scholar references",
+                    paper_id=paper_id,
+                    doi=doi,
+                    openalex_items=len(openalex_result.items),
+                )
+                return PaperCollectionResponse(
+                    source="semantic_scholar",
+                    kind="references",
+                    identifier=(
+                        semantic_scholar_paper.source_id
+                        if semantic_scholar_paper
+                        else openalex_result.identifier
+                    ),
+                    limit=openalex_result.limit,
+                    offset=openalex_result.offset,
+                    next_offset=openalex_result.next_offset,
+                    total=openalex_result.total,
+                    items=openalex_result.items,
+                )
+        except Exception as exc:
+            ctx.info(
+                "OpenAlex references provider failed; falling back to Semantic Scholar",
+                paper_id=paper_id,
+                doi=doi,
+                openalex_error=str(exc),
+            )
+
     result = await runtime.semantic_scholar.get_references(
         paper_id=paper_id,
         limit=limit,
@@ -129,7 +203,7 @@ async def _get_semantic_scholar_references_with_fallback(
     if result.items:
         return result
 
-    paper = await runtime.semantic_scholar.get_paper(paper_id=paper_id)
+    paper = semantic_scholar_paper or await runtime.semantic_scholar.get_paper(paper_id=paper_id)
     if not _should_fallback_to_crossref_references(paper):
         return result
 
@@ -158,6 +232,93 @@ async def _get_semantic_scholar_references_with_fallback(
         total=fallback.total or paper.reference_count,
         items=fallback.items,
     )
+
+
+async def _get_openalex_citations_fallback(
+    runtime: ServerRuntime,
+    *,
+    paper_id: str,
+    limit: int,
+    offset: int,
+    ctx: Context,
+    semantic_scholar_error: Exception | None = None,
+) -> PaperCollectionResponse | None:
+    semantic_scholar_paper, doi = await _resolve_paper_and_doi(
+        runtime,
+        paper_id=paper_id,
+    )
+
+    if not doi:
+        return None
+
+    fallback = await runtime.openalex.get_citations(
+        identifier=doi,
+        limit=limit,
+        offset=offset,
+    )
+    if not fallback.items:
+        return None
+
+    ctx.info(
+        "OpenAlex primary provider for Semantic Scholar citations",
+        paper_id=paper_id,
+        doi=doi,
+        openalex_items=len(fallback.items),
+        semantic_scholar_error=str(semantic_scholar_error) if semantic_scholar_error else None,
+    )
+    return PaperCollectionResponse(
+        source="semantic_scholar",
+        kind="citations",
+        identifier=(semantic_scholar_paper.source_id if semantic_scholar_paper else fallback.identifier),
+        limit=fallback.limit,
+        offset=fallback.offset,
+        next_offset=fallback.next_offset,
+        total=fallback.total,
+        items=fallback.items,
+    )
+
+
+async def _get_semantic_scholar_citations_with_fallback(
+    runtime: ServerRuntime,
+    *,
+    paper_id: str,
+    limit: int,
+    offset: int,
+    ctx: Context,
+) -> PaperCollectionResponse:
+    openalex_result = await _get_openalex_citations_fallback(
+        runtime,
+        paper_id=paper_id,
+        limit=limit,
+        offset=offset,
+        ctx=ctx,
+    )
+    if openalex_result is not None:
+        return openalex_result
+
+    semantic_scholar_error: Exception | None = None
+    try:
+        result = await runtime.semantic_scholar.get_citations(
+            paper_id=paper_id,
+            limit=limit,
+            offset=offset,
+        )
+        if result.items:
+            return result
+    except Exception as exc:
+        semantic_scholar_error = exc
+        result = PaperCollectionResponse(
+            source="semantic_scholar",
+            kind="citations",
+            identifier=paper_id,
+            limit=limit,
+            offset=offset,
+            items=[],
+        )
+
+    if semantic_scholar_error is not None:
+        raise semantic_scholar_error
+    return result
 
 
 @mcp.tool(
@@ -212,10 +373,12 @@ async def semantic_scholar_citations(
     ctx = _require_context(ctx)
     runtime = _get_runtime(ctx)
     ctx.info("Semantic Scholar citations lookup", paper_id=paper_id, limit=limit, offset=offset)
-    result = await runtime.semantic_scholar.get_citations(
+    result = await _get_semantic_scholar_citations_with_fallback(
+        runtime,
         paper_id=paper_id,
         limit=limit,
         offset=offset,
+        ctx=ctx,
     )
     return result.model_dump(mode="json")
 

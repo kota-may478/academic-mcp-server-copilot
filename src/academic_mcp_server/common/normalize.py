@@ -543,3 +543,118 @@ def normalize_crossref_work(
         external_ids=external_ids,
         source_metadata=source_metadata,
     )
+
+
+def normalize_openalex_author(raw_authorship: dict[str, Any]) -> Author:
+    raw_author = raw_authorship.get("author") or {}
+    institutions = raw_authorship.get("institutions") or []
+    affiliations = [
+        affiliation
+        for affiliation in (
+            normalize_text(institution.get("display_name"))
+            for institution in institutions
+            if isinstance(institution, dict)
+        )
+        if affiliation
+    ]
+    orcid = parse_orcid(raw_author.get("orcid"))
+    external_ids: dict[str, Any] = {}
+    openalex_id = normalize_text(raw_author.get("id"))
+    if openalex_id:
+        external_ids["OpenAlex"] = openalex_id
+    if orcid:
+        external_ids["ORCID"] = orcid
+
+    return Author(
+        name=normalize_text(raw_author.get("display_name")) or "Unknown author",
+        author_id=openalex_id,
+        affiliations=affiliations,
+        orcid=orcid,
+        url=openalex_id,
+        external_ids=external_ids,
+    )
+
+
+def normalize_openalex_work(
+    raw_work: dict[str, Any],
+    *,
+    extra_metadata: dict[str, Any] | None = None,
+) -> Paper:
+    ids = raw_work.get("ids") or {}
+    openalex_id = normalize_text(ids.get("openalex")) or normalize_text(raw_work.get("id"))
+    doi_url = normalize_text(ids.get("doi")) or normalize_text(raw_work.get("doi"))
+    doi = None
+    if doi_url:
+        doi = doi_url.removeprefix("https://doi.org/").removeprefix("http://doi.org/")
+
+    author_details = [
+        normalize_openalex_author(authorship)
+        for authorship in (raw_work.get("authorships") or [])
+        if isinstance(authorship, dict)
+    ]
+
+    primary_location = raw_work.get("primary_location") or {}
+    source = primary_location.get("source") or {}
+    best_oa_location = raw_work.get("best_oa_location") or {}
+    open_access = raw_work.get("open_access") or {}
+    primary_topic = raw_work.get("primary_topic") or {}
+
+    external_ids: dict[str, Any] = {}
+    if openalex_id:
+        external_ids["OpenAlex"] = openalex_id
+    if doi:
+        external_ids["DOI"] = doi
+
+    source_metadata: dict[str, Any] = {}
+    counts_by_year = raw_work.get("counts_by_year") or []
+    if counts_by_year:
+        source_metadata["counts_by_year"] = counts_by_year
+    topics = raw_work.get("topics") or []
+    if topics:
+        source_metadata["topics"] = topics
+    if extra_metadata:
+        for key, value in extra_metadata.items():
+            if value not in (None, [], {}, ""):
+                source_metadata[key] = value
+
+    return Paper(
+        source="openalex",
+        source_id=openalex_id or doi or "unknown",
+        title=normalize_text(raw_work.get("display_name")) or normalize_text(raw_work.get("title")) or "Untitled",
+        abstract=normalize_text(raw_work.get("abstract")),
+        authors=[author.name for author in author_details],
+        author_details=author_details,
+        published=normalize_text(raw_work.get("publication_date")) or year_to_iso(raw_work.get("publication_year")),
+        updated=normalize_text(raw_work.get("updated_date")) or normalize_text(raw_work.get("created_date")),
+        doi=doi,
+        venue=normalize_text(source.get("display_name")) or normalize_text(primary_location.get("raw_source_name")),
+        publisher=normalize_text(source.get("host_organization_name")),
+        url=openalex_id,
+        pdf_url=normalize_text(best_oa_location.get("pdf_url")) or normalize_text(open_access.get("oa_url")),
+        citation_count=coerce_int(raw_work.get("cited_by_count")),
+        reference_count=coerce_int(raw_work.get("referenced_works_count")),
+        is_open_access=normalize_bool(open_access.get("is_oa")),
+        license=normalize_text(best_oa_location.get("license")) or normalize_text(primary_location.get("license")),
+        primary_subject=normalize_text(primary_topic.get("display_name")),
+        publication_types=normalize_text_list(raw_work.get("type")),
+        funders=[
+            funder_name
+            for funder_name in (
+                normalize_text(funder.get("display_name"))
+                for funder in (raw_work.get("funders") or [])
+                if isinstance(funder, dict)
+            )
+            if funder_name
+        ],
+        subjects=[
+            subject
+            for subject in (
+                normalize_text(concept.get("display_name"))
+                for concept in (raw_work.get("concepts") or [])
+                if isinstance(concept, dict)
+            )
+            if subject
+        ],
+        external_ids=external_ids,
+        source_metadata=source_metadata,
+    )

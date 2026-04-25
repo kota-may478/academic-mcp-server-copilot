@@ -22,7 +22,7 @@ This repository provides one MCP server process, not three separate servers. The
 - A local virtual environment at `.venv`
 - VS Code with GitHub Copilot and MCP support enabled
 
-Semantic Scholar API access works without an API key at lower public limits, but an API key is strongly recommended because the public tier can return HTTP 429 quickly. Crossref requires a contact email for responsible API identification.
+Semantic Scholar API access works without an API key at lower public limits, but an API key is strongly recommended because the public tier can return HTTP 429 quickly. Crossref requires a contact email for responsible API identification. OpenAlex polite-pool access uses a contact email as well, managed through environment variables or MCP inputs.
 
 ## Installation
 
@@ -72,6 +72,11 @@ Use absolute paths so the server can start even when a different workspace is op
 			"type": "promptString",
 			"id": "academic-paper-contact-email",
 			"description": "Contact email for Crossref and academicPaperSearch"
+		},
+		{
+			"type": "promptString",
+			"id": "academic-paper-openalex-contact-email",
+			"description": "Optional dedicated contact email for OpenAlex polite pool"
 		}
 	],
 	"servers": {
@@ -87,7 +92,8 @@ Use absolute paths so the server can start even when a different workspace is op
 				"PYTHONPATH": "C:/path/to/academic-mcp-server-copilot/src",
 				"PYTHONUNBUFFERED": "1",
 				"ACADEMIC_MCP_SEMANTIC_SCHOLAR_API_KEY": "${input:academic-paper-semantic-scholar-api-key}",
-				"ACADEMIC_MCP_CONTACT_EMAIL": "${input:academic-paper-contact-email}"
+				"ACADEMIC_MCP_CONTACT_EMAIL": "${input:academic-paper-contact-email}",
+				"ACADEMIC_MCP_OPENALEX_CONTACT_EMAIL": "${input:academic-paper-openalex-contact-email}"
 			},
 			"dev": {
 				"watch": "C:/path/to/academic-mcp-server-copilot/src/**/*.py",
@@ -117,6 +123,11 @@ Create `.vscode/mcp.json` locally when you want the config to follow the current
 			"type": "promptString",
 			"id": "academic-paper-contact-email",
 			"description": "Contact email for Crossref and academicPaperSearch"
+		},
+		{
+			"type": "promptString",
+			"id": "academic-paper-openalex-contact-email",
+			"description": "Optional dedicated contact email for OpenAlex polite pool"
 		}
 	],
 	"servers": {
@@ -131,7 +142,8 @@ Create `.vscode/mcp.json` locally when you want the config to follow the current
 				"PYTHONPATH": "${workspaceFolder}/src",
 				"PYTHONUNBUFFERED": "1",
 				"ACADEMIC_MCP_SEMANTIC_SCHOLAR_API_KEY": "${input:academic-paper-semantic-scholar-api-key}",
-				"ACADEMIC_MCP_CONTACT_EMAIL": "${input:academic-paper-contact-email}"
+				"ACADEMIC_MCP_CONTACT_EMAIL": "${input:academic-paper-contact-email}",
+				"ACADEMIC_MCP_OPENALEX_CONTACT_EMAIL": "${input:academic-paper-openalex-contact-email}"
 			},
 			"dev": {
 				"watch": "${workspaceFolder}/src/**/*.py",
@@ -207,8 +219,14 @@ If tool metadata does not refresh after edits, run `MCP: Reset Cached Tools` and
 ## Notes On API Behavior
 
 - Semantic Scholar sends `x-api-key` only when a key is configured, and this server serializes Semantic Scholar traffic to 1 request per second cumulatively across its Graph and Recommendations endpoints.
+- Semantic Scholar paper and relation lookups cache canonical `paperId` mappings for DOI and other external IDs, so forward/backward snowballing after search results does not need to re-resolve the same paper repeatedly.
 - Semantic Scholar exposes additional tools for paper batches, citations, references, authors, and recommendations.
-- When Semantic Scholar reports an empty reference list for a paper that still has a DOI and positive reference count, `semantic_scholar_references` falls back to Crossref references so backward snowballing can continue.
+- Relation traversal now prefers OpenAlex first when a DOI is available, because OpenAlex exposes both public `referenced_works` and public cited-by traversal with more stable anonymous access than Semantic Scholar's public tier.
+- Backward snowballing order is `OpenAlex -> Semantic Scholar -> Crossref`.
+- Forward snowballing order is `OpenAlex -> Semantic Scholar`.
+- Crossref remains the final backward-only fallback because public REST exposes deposited `reference` lists and `is-referenced-by-count`, but not the anonymous full citing-work list.
+- OpenAlex requests always include a polite-pool contact email. The server uses `ACADEMIC_MCP_OPENALEX_CONTACT_EMAIL` when set, otherwise it reuses `ACADEMIC_MCP_CONTACT_EMAIL`.
+- OpenAlex does not require an API key for this basic usage. An OpenAlex key is only needed later if you want materially higher-volume usage.
 - arXiv uses the legacy query API and enforces single-request behavior with at least a 3-second interval between requests, matching the current arXiv API terms.
 - arXiv exact lookup uses `id_list` so you can fetch a specific paper and keep richer arXiv metadata.
 - arXiv full-text analysis prefers `/src/<id>` to parse TeX sources and extract figure/table captions, then falls back to `/pdf/<id>.pdf` text extraction when source files are unavailable or non-textual.

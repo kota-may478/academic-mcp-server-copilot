@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-PaperSource = Literal["semantic_scholar", "arxiv", "crossref"]
+PaperSource = Literal["semantic_scholar", "arxiv", "crossref", "openalex"]
 SUPPORTED_SOURCES: tuple[PaperSource, ...] = (
     "semantic_scholar",
     "arxiv",

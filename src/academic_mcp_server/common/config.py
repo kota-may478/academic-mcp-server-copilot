@@ -46,10 +46,23 @@ def _parse_email(name: str) -> str:
     return parsed_email
 
 
+def _parse_optional_email(name: str) -> str | None:
+    raw_value = _clean_env(name)
+    if raw_value is None:
+        return None
+
+    _, parsed_email = parseaddr(raw_value)
+    if "@" not in parsed_email:
+        raise RuntimeError(f"{name} must be a valid email address.")
+
+    return parsed_email
+
+
 @dataclass(frozen=True, slots=True)
 class AppConfig:
     semantic_scholar_api_key: str | None
     contact_email: str
+    openalex_contact_email: str
     request_timeout_seconds: float
     cache_ttl_seconds: int
     default_limit: int
@@ -59,6 +72,10 @@ class AppConfig:
         return cls(
             semantic_scholar_api_key=_clean_env("ACADEMIC_MCP_SEMANTIC_SCHOLAR_API_KEY"),
             contact_email=_parse_email("ACADEMIC_MCP_CONTACT_EMAIL"),
+            openalex_contact_email=(
+                _parse_optional_email("ACADEMIC_MCP_OPENALEX_CONTACT_EMAIL")
+                or _parse_email("ACADEMIC_MCP_CONTACT_EMAIL")
+            ),
             request_timeout_seconds=_parse_positive_number(
                 "ACADEMIC_MCP_REQUEST_TIMEOUT_SECONDS",
                 20.0,
@@ -83,4 +100,14 @@ class AppConfig:
         return {
             "Accept": "application/json",
             "User-Agent": f"academic-mcp-server/{__version__} (mailto:{self.contact_email})",
+        }
+
+    @property
+    def openalex_headers(self) -> dict[str, str]:
+        return {
+            "Accept": "application/json",
+            "User-Agent": (
+                f"academic-mcp-server/{__version__} "
+                f"(mailto:{self.openalex_contact_email})"
+            ),
         }
