@@ -17,6 +17,7 @@ class OpenAlexConnector:
 
     _SELECT_FIELDS = (
         "id,doi,title,display_name,publication_year,publication_date,updated_date,created_date,"
+        "abstract_inverted_index,"
         "ids,authorships,primary_location,best_oa_location,open_access,cited_by_count,"
         "referenced_works_count,concepts,topics,counts_by_year,funders,type"
     )

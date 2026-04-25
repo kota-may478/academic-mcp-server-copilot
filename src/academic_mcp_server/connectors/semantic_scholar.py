@@ -307,10 +307,9 @@ class SemanticScholarConnector:
             kind="recommended_papers",
             identifier=normalized_identifier,
             limit=normalized_limit,
-            items=[
-                normalize_semantic_scholar_paper(item)
-                for item in payload.get("recommendedPapers") or []
-            ],
+            items=await self._normalize_recommendation_items(
+                payload.get("recommendedPapers") or []
+            ),
         )
         self._cache_papers(result.items)
         self._cache.set(cache_key, result)
@@ -358,14 +357,61 @@ class SemanticScholarConnector:
             kind="recommend_from_examples",
             identifier=",".join(normalized_positive_ids),
             limit=normalized_limit,
-            items=[
-                normalize_semantic_scholar_paper(item)
-                for item in payload.get("recommendedPapers") or []
-            ],
+            items=await self._normalize_recommendation_items(
+                payload.get("recommendedPapers") or []
+            ),
         )
         self._cache_papers(result.items)
         self._cache.set(cache_key, result)
         return result
+
+    async def _normalize_recommendation_items(self, raw_items: list[Any]) -> list[Paper]:
+        hydrated_papers_by_id: dict[str, Paper] = {}
+        raw_identifier_items: list[str] = []
+        normalized_items: list[Paper] = []
+
+        for raw_item in raw_items:
+            if isinstance(raw_item, dict):
+                normalized_items.append(normalize_semantic_scholar_paper(raw_item))
+                continue
+            if isinstance(raw_item, str):
+                raw_identifier_items.append(raw_item)
+
+        if raw_identifier_items:
+            try:
+                hydrated_batch = await self.get_papers_batch(raw_identifier_items)
+            except Exception as exc:
+                LOGGER.warning(
+                    "Falling back to placeholder recommendation papers after hydration failure: %s",
+                    exc,
+                )
+                hydrated_batch = PaperCollectionResponse(
+                    source="semantic_scholar",
+                    kind="paper_batch",
+                    items=[],
+                )
+            hydrated_papers_by_id = {
+                self._normalize_identifier(paper.source_id): paper
+                for paper in hydrated_batch.items
+            }
+
+        for raw_item in raw_items:
+            if not isinstance(raw_item, str):
+                continue
+            hydrated_paper = hydrated_papers_by_id.get(self._normalize_identifier(raw_item))
+            if hydrated_paper is not None:
+                normalized_items.append(hydrated_paper)
+                continue
+            normalized_items.append(
+                Paper(
+                    source="semantic_scholar",
+                    source_id=self._normalize_identifier(raw_item),
+                    title=f"Semantic Scholar paper {raw_item}",
+                    source_metadata={"hydration_failed": True},
+                )
+            )
+
+        return normalized_items
 
     async def _get_relation_collection(
         self,

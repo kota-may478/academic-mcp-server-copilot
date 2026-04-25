@@ -176,6 +176,8 @@ Environment variables consumed by the server:
 - `semantic_scholar_author_papers`: fetch papers for a Semantic Scholar author
 - `semantic_scholar_recommended_papers`: fetch recommended papers for a paper
 - `semantic_scholar_recommend_from_examples`: fetch recommendations from positive and negative example papers
+- `survey_paper_context`: build a survey-oriented paper context using Semantic Scholar for overview metadata, OpenAlex-first references/citations, and optional arXiv full-text enrichment
+- `survey_query_contexts`: search, rank, and analyze multiple survey candidates in one batch while preserving evidence/disclosure metadata for each paper
 - `arxiv_search`: search arXiv via the Atom API
 - `arxiv_paper`: fetch a single arXiv paper by arXiv ID or URL
 - `arxiv_full_text`: download and analyze arXiv full text from source files or PDF, with figure/table captions when available
@@ -222,9 +224,13 @@ If tool metadata does not refresh after edits, run `MCP: Reset Cached Tools` and
 - Semantic Scholar paper and relation lookups cache canonical `paperId` mappings for DOI and other external IDs, so forward/backward snowballing after search results does not need to re-resolve the same paper repeatedly.
 - Semantic Scholar exposes additional tools for paper batches, citations, references, authors, and recommendations.
 - Relation traversal now prefers OpenAlex first when a DOI is available, because OpenAlex exposes both public `referenced_works` and public cited-by traversal with more stable anonymous access than Semantic Scholar's public tier.
+- Survey-style single-paper analysis now uses Semantic Scholar as the primary source for title and abstract, keeps OpenAlex as the primary source for references and citations, and optionally enriches the result with arXiv full text when an arXiv record is found by explicit arXiv ID or normalized title match.
+- Batch survey analysis can reduce MCP request count because search, candidate selection, and multiple paper-context lookups are performed inside one server call while reusing the same in-process caches. This reduces client orchestration overhead and can reduce duplicate identifier resolution, although it does not guarantee fewer upstream API calls for every query.
 - Backward snowballing order is `OpenAlex -> Semantic Scholar -> Crossref`.
 - Forward snowballing order is `OpenAlex -> Semantic Scholar`.
 - Crossref remains the final backward-only fallback because public REST exposes deposited `reference` lists and `is-referenced-by-count`, but not the anonymous full citing-work list.
+- For overview lookups, the fallback order is `Semantic Scholar -> OpenAlex -> Crossref`. When Semantic Scholar resolves the paper but lacks an abstract, OpenAlex or Crossref can be used only to fill the missing abstract while keeping the resolved paper source as Semantic Scholar.
+- When neither abstract nor full text is publicly available, the server now emits a `title_only` content assessment with low confidence and an explicit article note stating that only the title and sparse metadata were checked. This is intended to be carried into downstream survey writing.
 - OpenAlex requests always include a polite-pool contact email. The server uses `ACADEMIC_MCP_OPENALEX_CONTACT_EMAIL` when set, otherwise it reuses `ACADEMIC_MCP_CONTACT_EMAIL`.
 - OpenAlex does not require an API key for this basic usage. An OpenAlex key is only needed later if you want materially higher-volume usage.
 - arXiv uses the legacy query API and enforces single-request behavior with at least a 3-second interval between requests, matching the current arXiv API terms.

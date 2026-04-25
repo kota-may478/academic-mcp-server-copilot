@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -11,11 +12,12 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from academic_mcp_server.common.config import AppConfig
 from academic_mcp_server.common.models import Paper, PaperCollectionResponse, SUPPORTED_SOURCES, PaperSource, SourceError, UnifiedSearchResponse
-from academic_mcp_server.common.normalize import normalize_limit, sort_papers_for_display
+from academic_mcp_server.common.normalize import first_text, normalize_limit, normalize_offset, normalize_text, sort_papers_for_display
 from academic_mcp_server.connectors import ArxivConnector, CrossrefConnector, OpenAlexConnector, SemanticScholarConnector
 
 
 LOGGER = logging.getLogger(__name__)
+_TITLE_NORMALIZATION_PATTERN = re.compile(r"[^a-z0-9]+")
 
 
 @dataclass(slots=True)
@@ -127,6 +129,214 @@ def _extract_doi_candidate(identifier: str) -> str | None:
     if "/" not in normalized or " " in normalized:
         return None
     return normalized
+
+
+def _normalize_title_key(title: str | None) -> str | None:
+    normalized = normalize_text(title)
+    if not normalized:
+        return None
+    key = _TITLE_NORMALIZATION_PATTERN.sub("", normalized.casefold())
+    return key or None
+
+
+def _extract_arxiv_identifier(paper: Paper) -> str | None:
+    raw_arxiv_id = paper.external_ids.get("ArXiv")
+    if isinstance(raw_arxiv_id, list):
+        return first_text(raw_arxiv_id)
+    return normalize_text(raw_arxiv_id)
+
+
+async def _find_matching_arxiv_paper(
+    runtime: ServerRuntime,
+    *,
+    paper: Paper,
+    ctx: Context,
+) -> tuple[Paper | None, str | None]:
+    explicit_arxiv_id = _extract_arxiv_identifier(paper)
+    if explicit_arxiv_id:
+        try:
+            return await runtime.arxiv.get_paper(arxiv_id=explicit_arxiv_id), "external_id"
+        except Exception as exc:
+            ctx.info(
+                "Explicit arXiv identifier lookup failed; falling back to title search",
+                arxiv_id=explicit_arxiv_id,
+                error=str(exc),
+            )
+
+    title_key = _normalize_title_key(paper.title)
+    if not title_key:
+        return None, None
+
+    search = await runtime.arxiv.search(query=paper.title, limit=5)
+    for candidate in search.items:
+        if _normalize_title_key(candidate.title) == title_key:
+            return candidate, "title_exact_normalized"
+    return None, None
+
+
+def _with_abstract_fallback(base_paper: Paper, fallback_paper: Paper, fallback_source: str) -> Paper:
+    if fallback_paper.abstract is None:
+        return base_paper
+
+    merged_metadata = dict(base_paper.source_metadata)
+    merged_metadata["abstract_fallback_source"] = fallback_source
+    return base_paper.model_copy(
+        update={
+            "abstract": fallback_paper.abstract,
+            "source_metadata": merged_metadata,
+            "pdf_url": base_paper.pdf_url or fallback_paper.pdf_url,
+            "url": base_paper.url or fallback_paper.url,
+        }
+    )
+
+
+def _infer_title_only_summary(paper: Paper) -> str:
+    segments = [f"This paper likely investigates: {paper.title}."]
+    if paper.primary_subject:
+        segments.append(f"The likely subject area is {paper.primary_subject}.")
+    if paper.venue:
+        segments.append(f"It appears to be published in {paper.venue}.")
+    segments.append(
+        "This understanding is inferred from the title and sparse metadata only, so it is low-confidence."
+    )
+    return " ".join(segments)
+
+
+def _build_content_assessment(
+    paper: Paper,
+    *,
+    arxiv_match: dict[str, Any] | None,
+    arxiv_full_text_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if arxiv_full_text_result is not None:
+        summary = paper.abstract or normalize_text(arxiv_full_text_result.get("full_text", "")[:1200])
+        return {
+            "basis": "full_text",
+            "confidence": "high",
+            "summary": summary,
+            "requires_explicit_disclosure": False,
+            "article_note": None,
+            "evidence": {
+                "abstract_available": paper.abstract is not None,
+                "arxiv_match_found": arxiv_match is not None,
+                "full_text_available": True,
+            },
+        }
+
+    if paper.abstract:
+        return {
+            "basis": "abstract",
+            "confidence": "medium",
+            "summary": paper.abstract,
+            "requires_explicit_disclosure": False,
+            "article_note": None,
+            "evidence": {
+                "abstract_available": True,
+                "arxiv_match_found": arxiv_match is not None,
+                "full_text_available": False,
+            },
+        }
+
+    return {
+        "basis": "title_only",
+        "confidence": "low",
+        "summary": _infer_title_only_summary(paper),
+        "requires_explicit_disclosure": True,
+        "article_note": (
+            "Only the title and sparse metadata could be checked for this paper; "
+            "no public abstract or full text was available during the survey."
+        ),
+        "evidence": {
+            "abstract_available": False,
+            "arxiv_match_found": arxiv_match is not None,
+            "full_text_available": False,
+        },
+    }
+
+
+def _score_survey_candidate(paper: Paper) -> int:
+    title = (paper.title or "").casefold()
+    publication_types = " ".join(paper.publication_types).casefold()
+    score = 0
+    if any(keyword in title for keyword in ("survey", "review", "systematic", "overview")):
+        score += 100
+    if any(keyword in publication_types for keyword in ("review", "survey")):
+        score += 80
+    if paper.abstract:
+        score += 20
+    if paper.doi:
+        score += 10
+    if paper.citation_count:
+        score += min(paper.citation_count, 50)
+    return score
+
+
+def _paper_identifier_for_survey_context(paper: Paper) -> str | None:
+    if paper.source == "semantic_scholar":
+        return paper.source_id
+    if paper.doi:
+        return paper.doi
+    return None
+
+
+def _select_survey_candidates(papers: list[Paper], *, limit: int) -> list[Paper]:
+    ranked_candidates = sorted(
+        enumerate(papers),
+        key=lambda item: (-_score_survey_candidate(item[1]), item[0]),
+    )
+
+    selected: list[Paper] = []
+    seen_keys: set[str] = set()
+    for _, paper in ranked_candidates:
+        dedupe_key = paper.doi or f"{paper.source}:{paper.source_id}"
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        selected.append(paper)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+async def _search_survey_seed_papers(
+    runtime: ServerRuntime,
+    *,
+    query: str,
+    search_limit: int,
+    ctx: Context,
+) -> tuple[list[Paper], dict[str, Any]]:
+    try:
+        semantic_result = await runtime.semantic_scholar.search(query=query, limit=search_limit)
+        if semantic_result.items:
+            return semantic_result.items, {
+                "primary": "semantic_scholar",
+                "fallback_order": ["search_papers"],
+                "resolved_source": "semantic_scholar",
+                "result_count": len(semantic_result.items),
+            }
+    except Exception as exc:
+        ctx.info("Semantic Scholar survey seed search failed; falling back to unified search", query=query, error=str(exc))
+
+    fallback_result = await asyncio.gather(
+        runtime.arxiv.search(query=query, limit=search_limit),
+        runtime.crossref.search_works(query=query, limit=search_limit),
+        return_exceptions=True,
+    )
+    items: list[Paper] = []
+    errors: list[str] = []
+    for source, result in zip(("arxiv", "crossref"), fallback_result, strict=True):
+        if isinstance(result, Exception):
+            errors.append(f"{source}: {result}")
+            continue
+        items.extend(result.items)
+
+    return items, {
+        "primary": "semantic_scholar",
+        "fallback_order": ["search_papers"],
+        "resolved_source": "fallback_search",
+        "result_count": len(items),
+        "errors": errors,
+    }
 
 
 async def _resolve_paper_and_doi(
@@ -321,6 +531,147 @@ async def _get_semantic_scholar_citations_with_fallback(
     return result
 
 
+async def _get_semantic_scholar_paper_with_fallback(
+    runtime: ServerRuntime,
+    *,
+    paper_id: str,
+    ctx: Context,
+) -> Paper:
+    doi = _extract_doi_candidate(paper_id)
+    semantic_scholar_error: Exception | None = None
+    try:
+        semantic_scholar_paper = await runtime.semantic_scholar.get_paper(paper_id=paper_id)
+        if semantic_scholar_paper.abstract or not semantic_scholar_paper.doi:
+            return semantic_scholar_paper
+        doi = semantic_scholar_paper.doi
+        ctx.info(
+            "Semantic Scholar paper lookup returned no abstract; trying OpenAlex enrichment",
+            paper_id=paper_id,
+            doi=doi,
+        )
+    except Exception as exc:
+        semantic_scholar_error = exc
+
+    if not doi:
+        if semantic_scholar_error is not None:
+            raise semantic_scholar_error
+        raise semantic_scholar_error
+
+    try:
+        fallback = await runtime.openalex.get_work(identifier=doi)
+        ctx.info(
+            "OpenAlex fallback for Semantic Scholar paper lookup",
+            paper_id=paper_id,
+            doi=doi,
+            semantic_scholar_error=str(semantic_scholar_error),
+        )
+        if semantic_scholar_error is None:
+            return _with_abstract_fallback(semantic_scholar_paper, fallback, "openalex")
+        return fallback
+    except Exception as openalex_exc:
+        ctx.info(
+            "OpenAlex paper fallback failed; falling back to Crossref",
+            paper_id=paper_id,
+            doi=doi,
+            openalex_error=str(openalex_exc),
+        )
+    crossref_paper = await runtime.crossref.get_work_by_doi(doi=doi)
+    if semantic_scholar_error is None:
+        return _with_abstract_fallback(semantic_scholar_paper, crossref_paper, "crossref")
+    return crossref_paper
+
+
+async def _build_survey_paper_context(
+    runtime: ServerRuntime,
+    *,
+    paper_id: str,
+    relation_limit: int,
+    relation_offset: int,
+    include_full_text: bool,
+    max_full_text_characters: int,
+    ctx: Context,
+) -> dict[str, Any]:
+    paper = await _get_semantic_scholar_paper_with_fallback(
+        runtime,
+        paper_id=paper_id,
+        ctx=ctx,
+    )
+    references, citations = await asyncio.gather(
+        _get_semantic_scholar_references_with_fallback(
+            runtime,
+            paper_id=paper.doi or paper.source_id,
+            limit=relation_limit,
+            offset=relation_offset,
+            ctx=ctx,
+        ),
+        _get_semantic_scholar_citations_with_fallback(
+            runtime,
+            paper_id=paper.doi or paper.source_id,
+            limit=relation_limit,
+            offset=relation_offset,
+            ctx=ctx,
+        ),
+    )
+
+    arxiv_match: dict[str, Any] | None = None
+    arxiv_full_text_result: dict[str, Any] | None = None
+    arxiv_notes: list[str] = []
+    try:
+        matched_arxiv_paper, matched_by = await _find_matching_arxiv_paper(
+            runtime,
+            paper=paper,
+            ctx=ctx,
+        )
+    except Exception as exc:
+        matched_arxiv_paper = None
+        matched_by = None
+        arxiv_notes.append(f"arxiv_match_failed: {exc}")
+
+    if matched_arxiv_paper is not None:
+        arxiv_match = {
+            "matched_by": matched_by,
+            "paper": matched_arxiv_paper.model_dump(mode="json"),
+        }
+        if include_full_text:
+            try:
+                full_text = await runtime.arxiv.analyze_full_text(
+                    arxiv_id=matched_arxiv_paper.source_id,
+                    prefer="source",
+                    max_characters=max_full_text_characters,
+                )
+                arxiv_full_text_result = full_text.model_dump(mode="json")
+            except Exception as exc:
+                arxiv_notes.append(f"arxiv_full_text_failed: {exc}")
+
+    content_assessment = _build_content_assessment(
+        paper,
+        arxiv_match=arxiv_match,
+        arxiv_full_text_result=arxiv_full_text_result,
+    )
+
+    return {
+        "query_paper_id": paper_id,
+        "paper": paper.model_dump(mode="json"),
+        "overview_strategy": {
+            "primary": "semantic_scholar",
+            "fallback_order": ["openalex", "crossref"],
+            "resolved_source": paper.source,
+        },
+        "references": references.model_dump(mode="json"),
+        "citations": citations.model_dump(mode="json"),
+        "relation_strategy": {
+            "references_primary": "openalex",
+            "references_fallback_order": ["semantic_scholar", "crossref"],
+            "citations_primary": "openalex",
+            "citations_fallback_order": ["semantic_scholar"],
+        },
+        "arxiv_match": arxiv_match,
+        "arxiv_full_text": arxiv_full_text_result,
+        "content_assessment": content_assessment,
+        "notes": arxiv_notes,
+    }
+
+
 @mcp.tool(
     name="semantic_scholar_search",
     description="Search Semantic Scholar papers by keyword query.",
@@ -341,8 +692,165 @@ async def semantic_scholar_paper(paper_id: str, ctx: Context | None = None) -> d
     ctx = _require_context(ctx)
     runtime = _get_runtime(ctx)
     ctx.info("Semantic Scholar paper lookup", paper_id=paper_id)
-    result = await runtime.semantic_scholar.get_paper(paper_id=paper_id)
+    result = await _get_semantic_scholar_paper_with_fallback(
+        runtime,
+        paper_id=paper_id,
+        ctx=ctx,
+    )
     return result.model_dump(mode="json")
+
+
+@mcp.tool(
+    name="survey_paper_context",
+    description=(
+        "Build a literature-survey context for one paper: use Semantic Scholar for the paper abstract, "
+        "OpenAlex-first fallbacks for references and citations, and arXiv full text when the same paper is found on arXiv."
+    ),
+)
+async def survey_paper_context(
+    paper_id: str,
+    relation_limit: int = 10,
+    relation_offset: int = 0,
+    include_full_text: bool = True,
+    max_full_text_characters: int = 200000,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    normalized_relation_limit = normalize_limit(
+        relation_limit,
+        default=runtime.config.default_limit,
+        maximum=20,
+    )
+    normalized_relation_offset = normalize_offset(relation_offset)
+    ctx.info(
+        "Survey paper context lookup",
+        paper_id=paper_id,
+        relation_limit=normalized_relation_limit,
+        relation_offset=normalized_relation_offset,
+        include_full_text=include_full_text,
+        max_full_text_characters=max_full_text_characters,
+    )
+    return await _build_survey_paper_context(
+        runtime,
+        paper_id=paper_id,
+        relation_limit=normalized_relation_limit,
+        relation_offset=normalized_relation_offset,
+        include_full_text=include_full_text,
+        max_full_text_characters=max_full_text_characters,
+        ctx=ctx,
+    )
+
+
+@mcp.tool(
+    name="survey_query_contexts",
+    description=(
+        "Search papers for a literature-survey query, choose the most promising candidates, and build survey contexts for each in one batch. "
+        "This reduces MCP round trips and keeps per-paper disclosure metadata together."
+    ),
+)
+async def survey_query_contexts(
+    query: str,
+    search_limit: int = 10,
+    paper_limit: int = 3,
+    relation_limit: int = 10,
+    relation_offset: int = 0,
+    include_full_text: bool = True,
+    max_full_text_characters: int = 200000,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    runtime = _get_runtime(ctx)
+    normalized_search_limit = normalize_limit(
+        search_limit,
+        default=runtime.config.default_limit,
+        maximum=20,
+    )
+    normalized_paper_limit = normalize_limit(
+        paper_limit,
+        default=min(runtime.config.default_limit, 3),
+        maximum=10,
+    )
+    normalized_relation_limit = normalize_limit(
+        relation_limit,
+        default=runtime.config.default_limit,
+        maximum=20,
+    )
+    normalized_relation_offset = normalize_offset(relation_offset)
+    ctx.info(
+        "Survey query batch context lookup",
+        query=query,
+        search_limit=normalized_search_limit,
+        paper_limit=normalized_paper_limit,
+        relation_limit=normalized_relation_limit,
+        relation_offset=normalized_relation_offset,
+        include_full_text=include_full_text,
+    )
+
+    seed_papers, search_strategy = await _search_survey_seed_papers(
+        runtime,
+        query=query,
+        search_limit=normalized_search_limit,
+        ctx=ctx,
+    )
+    selected_papers = _select_survey_candidates(seed_papers, limit=normalized_paper_limit)
+
+    contexts: list[dict[str, Any]] = []
+    skipped_candidates: list[dict[str, Any]] = []
+    title_only_papers: list[dict[str, Any]] = []
+    for paper in selected_papers:
+        paper_identifier = _paper_identifier_for_survey_context(paper)
+        if paper_identifier is None:
+            skipped_candidates.append(
+                {
+                    "paper": paper.model_dump(mode="json"),
+                    "reason": "No DOI or Semantic Scholar identifier available for survey context resolution.",
+                }
+            )
+            continue
+        context_result = await _build_survey_paper_context(
+            runtime,
+            paper_id=paper_identifier,
+            relation_limit=normalized_relation_limit,
+            relation_offset=normalized_relation_offset,
+            include_full_text=include_full_text,
+            max_full_text_characters=max_full_text_characters,
+            ctx=ctx,
+        )
+        context_result["selection"] = {
+            "score": _score_survey_candidate(paper),
+            "selected_from_query": query.strip(),
+        }
+        contexts.append(context_result)
+        content_assessment = context_result.get("content_assessment") or {}
+        if content_assessment.get("basis") == "title_only":
+            title_only_papers.append(
+                {
+                    "query_paper_id": context_result.get("query_paper_id"),
+                    "source": context_result["paper"].get("source"),
+                    "source_id": context_result["paper"].get("source_id"),
+                    "title": context_result["paper"].get("title"),
+                    "doi": context_result["paper"].get("doi"),
+                    "article_note": content_assessment.get("article_note"),
+                    "summary": content_assessment.get("summary"),
+                }
+            )
+
+    return {
+        "query": query.strip(),
+        "search_strategy": search_strategy,
+        "batch_benefits": {
+            "reduces_mcp_round_trips": True,
+            "shares_server_side_cache": True,
+            "can_reduce_duplicate_identifier_resolution": True,
+            "upstream_request_count_guaranteed_lower": False,
+        },
+        "selected_count": len(contexts),
+        "selected_contexts": contexts,
+        "title_only_papers": title_only_papers,
+        "title_only_count": len(title_only_papers),
+        "skipped_candidates": skipped_candidates,
+    }
 
 
 @mcp.tool(

@@ -215,16 +215,22 @@ def normalize_semantic_scholar_paper(
     if tldr:
         source_metadata["tldr"] = tldr
 
-    publication_venue = raw_paper.get("publicationVenue") or {}
-    publication_venue_name = normalize_text(publication_venue.get("name"))
+    publication_venue_raw = raw_paper.get("publicationVenue")
+    publication_venue = (
+        publication_venue_raw if isinstance(publication_venue_raw, dict) else {}
+    )
+    publication_venue_name = normalize_text(publication_venue.get("name")) or normalize_text(
+        publication_venue_raw
+    )
     if publication_venue_name:
         source_metadata["publication_venue"] = publication_venue_name
 
-    journal = raw_paper.get("journal") or {}
+    journal_raw = raw_paper.get("journal")
+    journal = journal_raw if isinstance(journal_raw, dict) else {}
     journal_metadata = {
         key: value
         for key, value in {
-            "name": normalize_text(journal.get("name")),
+            "name": normalize_text(journal.get("name")) or normalize_text(journal_raw),
             "volume": normalize_text(journal.get("volume")),
             "pages": normalize_text(journal.get("pages")),
         }.items()
@@ -236,7 +242,9 @@ def normalize_semantic_scholar_paper(
     text_availability = normalize_text(raw_paper.get("textAvailability"))
     if text_availability:
         source_metadata["text_availability"] = text_availability
-    open_access_disclaimer = normalize_text((raw_paper.get("openAccessPdf") or {}).get("disclaimer"))
+    open_access_pdf_raw = raw_paper.get("openAccessPdf")
+    open_access_pdf = open_access_pdf_raw if isinstance(open_access_pdf_raw, dict) else {}
+    open_access_disclaimer = normalize_text(open_access_pdf.get("disclaimer"))
     if open_access_disclaimer:
         source_metadata["open_access_disclaimer"] = open_access_disclaimer
 
@@ -263,12 +271,12 @@ def normalize_semantic_scholar_paper(
         venue=normalize_text(raw_paper.get("venue")),
         publisher=publication_venue_name or normalize_text(journal.get("name")),
         url=normalize_text(raw_paper.get("url")),
-        pdf_url=normalize_text((raw_paper.get("openAccessPdf") or {}).get("url")),
+        pdf_url=normalize_text(open_access_pdf.get("url")),
         citation_count=coerce_int(raw_paper.get("citationCount")),
         reference_count=coerce_int(raw_paper.get("referenceCount")),
         influential_citation_count=coerce_int(raw_paper.get("influentialCitationCount")),
         is_open_access=normalize_bool(raw_paper.get("isOpenAccess")),
-        license=normalize_text((raw_paper.get("openAccessPdf") or {}).get("license")),
+        license=normalize_text(open_access_pdf.get("license")),
         primary_subject=primary_subject,
         publication_types=normalize_text_list(raw_paper.get("publicationTypes")),
         subjects=[
@@ -575,6 +583,27 @@ def normalize_openalex_author(raw_authorship: dict[str, Any]) -> Author:
     )
 
 
+def reconstruct_openalex_abstract(abstract_inverted_index: Any) -> str | None:
+    if not isinstance(abstract_inverted_index, dict):
+        return None
+
+    indexed_tokens: list[tuple[int, str]] = []
+    for token, positions in abstract_inverted_index.items():
+        normalized_token = normalize_text(token)
+        if not normalized_token or not isinstance(positions, list):
+            continue
+        for position in positions:
+            coerced_position = coerce_int(position)
+            if coerced_position is not None:
+                indexed_tokens.append((coerced_position, normalized_token))
+
+    if not indexed_tokens:
+        return None
+
+    indexed_tokens.sort(key=lambda item: item[0])
+    return " ".join(token for _, token in indexed_tokens)
+
+
 def normalize_openalex_work(
     raw_work: dict[str, Any],
     *,
@@ -612,6 +641,9 @@ def normalize_openalex_work(
     topics = raw_work.get("topics") or []
     if topics:
         source_metadata["topics"] = topics
+    abstract_inverted_index = raw_work.get("abstract_inverted_index")
+    if isinstance(abstract_inverted_index, dict) and abstract_inverted_index:
+        source_metadata["abstract_inverted_index"] = abstract_inverted_index
     if extra_metadata:
         for key, value in extra_metadata.items():
             if value not in (None, [], {}, ""):
@@ -621,7 +653,9 @@ def normalize_openalex_work(
         source="openalex",
         source_id=openalex_id or doi or "unknown",
         title=normalize_text(raw_work.get("display_name")) or normalize_text(raw_work.get("title")) or "Untitled",
-        abstract=normalize_text(raw_work.get("abstract")),
+        abstract=normalize_text(raw_work.get("abstract")) or reconstruct_openalex_abstract(
+            abstract_inverted_index
+        ),
         authors=[author.name for author in author_details],
         author_details=author_details,
         published=normalize_text(raw_work.get("publication_date")) or year_to_iso(raw_work.get("publication_year")),
