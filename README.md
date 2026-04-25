@@ -221,6 +221,7 @@ If tool metadata does not refresh after edits, run `MCP: Reset Cached Tools` and
 ## Notes On API Behavior
 
 - Semantic Scholar sends `x-api-key` only when a key is configured, and this server serializes Semantic Scholar traffic to 1 request per second cumulatively across its Graph and Recommendations endpoints.
+- When Semantic Scholar exhausts local retries on HTTP 429, survey-oriented tools now surface that relation traversal as `pending_rate_limited` work instead of failing the entire batch immediately. This allows downstream PRISMA-style prompts to distinguish `closure not reached yet` from `search completed`.
 - Semantic Scholar paper and relation lookups cache canonical `paperId` mappings for DOI and other external IDs, so forward/backward snowballing after search results does not need to re-resolve the same paper repeatedly.
 - Semantic Scholar exposes additional tools for paper batches, citations, references, authors, and recommendations.
 - Relation traversal now prefers OpenAlex first when a DOI is available, because OpenAlex exposes both public `referenced_works` and public cited-by traversal with more stable anonymous access than Semantic Scholar's public tier.

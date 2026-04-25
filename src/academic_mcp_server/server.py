@@ -14,6 +14,7 @@ from academic_mcp_server.common.config import AppConfig
 from academic_mcp_server.common.models import Paper, PaperCollectionResponse, SUPPORTED_SOURCES, PaperSource, SourceError, UnifiedSearchResponse
 from academic_mcp_server.common.normalize import first_text, normalize_limit, normalize_offset, normalize_text, sort_papers_for_display
 from academic_mcp_server.connectors import ArxivConnector, CrossrefConnector, OpenAlexConnector, SemanticScholarConnector
+from academic_mcp_server.connectors.semantic_scholar import SemanticScholarRateLimitError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -279,6 +280,32 @@ def _paper_identifier_for_survey_context(paper: Paper) -> str | None:
     return None
 
 
+def _build_pending_relation_response(
+    *,
+    kind: str,
+    identifier: str,
+    limit: int,
+    offset: int,
+    message: str,
+    retry_after_seconds: float | None,
+) -> PaperCollectionResponse:
+    return PaperCollectionResponse(
+        source="semantic_scholar",
+        kind=kind,
+        identifier=identifier,
+        limit=limit,
+        offset=offset,
+        items=[],
+        response_metadata={
+            "status": "pending_rate_limited",
+            "provider": "semantic_scholar",
+            "blocking_closure": True,
+            "message": message,
+            "retry_after_seconds": retry_after_seconds,
+        },
+    )
+
+
 def _select_survey_candidates(papers: list[Paper], *, limit: int) -> list[Paper]:
     ranked_candidates = sorted(
         enumerate(papers),
@@ -405,11 +432,68 @@ async def _get_semantic_scholar_references_with_fallback(
                 openalex_error=str(exc),
             )
 
-    result = await runtime.semantic_scholar.get_references(
-        paper_id=paper_id,
-        limit=limit,
-        offset=offset,
-    )
+    try:
+        result = await runtime.semantic_scholar.get_references(
+            paper_id=paper_id,
+            limit=limit,
+            offset=offset,
+        )
+    except SemanticScholarRateLimitError as exc:
+        if doi:
+            try:
+                fallback = await runtime.crossref.get_work_references(
+                    doi=doi,
+                    limit=limit,
+                    offset=offset,
+                )
+                if fallback.items:
+                    ctx.info(
+                        "Crossref fallback used after Semantic Scholar reference rate limit",
+                        paper_id=paper_id,
+                        doi=doi,
+                        retry_after_seconds=exc.retry_after_seconds,
+                    )
+                    return PaperCollectionResponse(
+                        source="semantic_scholar",
+                        kind="references",
+                        identifier=(
+                            semantic_scholar_paper.source_id
+                            if semantic_scholar_paper
+                            else fallback.identifier
+                        ),
+                        limit=fallback.limit,
+                        offset=fallback.offset,
+                        next_offset=fallback.next_offset,
+                        total=fallback.total,
+                        items=fallback.items,
+                        response_metadata={
+                            "status": "fallback_crossref_after_rate_limit",
+                            "provider": "crossref",
+                            "blocking_closure": False,
+                            "semantic_scholar_retry_after_seconds": exc.retry_after_seconds,
+                        },
+                    )
+            except Exception as fallback_exc:
+                ctx.info(
+                    "Crossref fallback also failed after Semantic Scholar reference rate limit",
+                    paper_id=paper_id,
+                    doi=doi,
+                    crossref_error=str(fallback_exc),
+                )
+        ctx.info(
+            "Semantic Scholar references remain pending due to rate limit",
+            paper_id=paper_id,
+            doi=doi,
+            retry_after_seconds=exc.retry_after_seconds,
+        )
+        return _build_pending_relation_response(
+            kind="references",
+            identifier=paper_id,
+            limit=limit,
+            offset=offset,
+            message=str(exc),
+            retry_after_seconds=exc.retry_after_seconds,
+        )
     if result.items:
         return result
 
@@ -417,11 +501,20 @@ async def _get_semantic_scholar_references_with_fallback(
     if not _should_fallback_to_crossref_references(paper):
         return result
 
-    fallback = await runtime.crossref.get_work_references(
-        doi=paper.doi,
-        limit=limit,
-        offset=offset,
-    )
+    try:
+        fallback = await runtime.crossref.get_work_references(
+            doi=paper.doi,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as exc:
+        ctx.info(
+            "Crossref fallback for Semantic Scholar references failed",
+            paper_id=paper.source_id,
+            doi=paper.doi,
+            crossref_error=str(exc),
+        )
+        return result
     if not fallback.items:
         return result
 
@@ -461,11 +554,20 @@ async def _get_openalex_citations_fallback(
     if not doi:
         return None
 
-    fallback = await runtime.openalex.get_citations(
-        identifier=doi,
-        limit=limit,
-        offset=offset,
-    )
+    try:
+        fallback = await runtime.openalex.get_citations(
+            identifier=doi,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as exc:
+        ctx.info(
+            "OpenAlex citations provider failed; falling back to Semantic Scholar",
+            paper_id=paper_id,
+            doi=doi,
+            openalex_error=str(exc),
+        )
+        return None
     if not fallback.items:
         return None
 
@@ -515,6 +617,20 @@ async def _get_semantic_scholar_citations_with_fallback(
         )
         if result.items:
             return result
+    except SemanticScholarRateLimitError as exc:
+        ctx.info(
+            "Semantic Scholar citations remain pending due to rate limit",
+            paper_id=paper_id,
+            retry_after_seconds=exc.retry_after_seconds,
+        )
+        return _build_pending_relation_response(
+            kind="citations",
+            identifier=paper_id,
+            limit=limit,
+            offset=offset,
+            message=str(exc),
+            retry_after_seconds=exc.retry_after_seconds,
+        )
     except Exception as exc:
         semantic_scholar_error = exc
         result = PaperCollectionResponse(
@@ -649,6 +765,20 @@ async def _build_survey_paper_context(
         arxiv_full_text_result=arxiv_full_text_result,
     )
 
+    pending_relations: list[dict[str, Any]] = []
+    for relation_name, relation_response in (("references", references), ("citations", citations)):
+        relation_metadata = relation_response.response_metadata
+        if relation_metadata.get("blocking_closure"):
+            pending_relations.append(
+                {
+                    "relation": relation_name,
+                    "status": relation_metadata.get("status"),
+                    "provider": relation_metadata.get("provider"),
+                    "retry_after_seconds": relation_metadata.get("retry_after_seconds"),
+                    "message": relation_metadata.get("message"),
+                }
+            )
+
     return {
         "query_paper_id": paper_id,
         "paper": paper.model_dump(mode="json"),
@@ -664,6 +794,11 @@ async def _build_survey_paper_context(
             "references_fallback_order": ["semantic_scholar", "crossref"],
             "citations_primary": "openalex",
             "citations_fallback_order": ["semantic_scholar"],
+        },
+        "relation_audit": {
+            "pending_count": len(pending_relations),
+            "pending_relations": pending_relations,
+            "closure_blocked": bool(pending_relations),
         },
         "arxiv_match": arxiv_match,
         "arxiv_full_text": arxiv_full_text_result,
@@ -798,6 +933,7 @@ async def survey_query_contexts(
     contexts: list[dict[str, Any]] = []
     skipped_candidates: list[dict[str, Any]] = []
     title_only_papers: list[dict[str, Any]] = []
+    pending_relation_jobs: list[dict[str, Any]] = []
     for paper in selected_papers:
         paper_identifier = _paper_identifier_for_survey_context(paper)
         if paper_identifier is None:
@@ -822,6 +958,8 @@ async def survey_query_contexts(
             "selected_from_query": query.strip(),
         }
         contexts.append(context_result)
+        relation_audit = context_result.get("relation_audit") or {}
+        pending_relation_jobs.extend(relation_audit.get("pending_relations") or [])
         content_assessment = context_result.get("content_assessment") or {}
         if content_assessment.get("basis") == "title_only":
             title_only_papers.append(
@@ -847,6 +985,11 @@ async def survey_query_contexts(
         },
         "selected_count": len(contexts),
         "selected_contexts": contexts,
+        "closure_audit": {
+            "pending_relation_jobs": pending_relation_jobs,
+            "pending_relation_count": len(pending_relation_jobs),
+            "closure_blocked_by_pending_relations": bool(pending_relation_jobs),
+        },
         "title_only_papers": title_only_papers,
         "title_only_count": len(title_only_papers),
         "skipped_candidates": skipped_candidates,

@@ -21,6 +21,25 @@ from academic_mcp_server.common.normalize import normalize_limit, normalize_offs
 LOGGER = logging.getLogger(__name__)
 
 
+class SemanticScholarRateLimitError(RuntimeError):
+    """Raised when Semantic Scholar remains rate-limited after local retries are exhausted."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None,
+        method: str,
+        path: str,
+        status_code: int = 429,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+        self.method = method
+        self.path = path
+        self.status_code = status_code
+
+
 class SemanticScholarConnector:
     """Async client for Semantic Scholar Graph API."""
 
@@ -552,11 +571,27 @@ class SemanticScholarConnector:
                         if retry_delay_seconds > 0:
                             await asyncio.sleep(retry_delay_seconds)
                         continue
+                    if exc.response.status_code == 429:
+                        retry_after_seconds = self._parse_retry_after_seconds(
+                            exc.response.headers.get("Retry-After")
+                        )
+                        raise SemanticScholarRateLimitError(
+                            self._format_http_error(exc),
+                            retry_after_seconds=retry_after_seconds,
+                            method=method,
+                            path=path,
+                            status_code=exc.response.status_code,
+                        ) from exc
                     raise RuntimeError(self._format_http_error(exc)) from exc
                 except httpx.HTTPError as exc:
                     raise RuntimeError(f"Semantic Scholar request failed: {exc}") from exc
 
-        raise RuntimeError("Semantic Scholar request failed after exhausting retries.")
+        raise SemanticScholarRateLimitError(
+            "Semantic Scholar request failed after exhausting retries.",
+            retry_after_seconds=None,
+            method=method,
+            path=path,
+        )
 
     async def _resolve_relation_identifier(self, paper_id: str) -> str:
         normalized_identifier = self._normalize_identifier(paper_id)

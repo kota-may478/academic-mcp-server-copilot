@@ -106,6 +106,7 @@ class PaperCollectionResponse(BaseModel):
     next_offset: int | None = None
     total: int | None = None
     items: list[Paper] = Field(default_factory=list)
+    response_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AuthorCollectionResponse(BaseModel):
