@@ -44,6 +44,10 @@ class SemanticScholarConnector:
     """Async client for Semantic Scholar Graph API."""
 
     _SEMANTIC_SCHOLAR_PAPER_ID_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+    _ARXIV_IDENTIFIER_PATTERN = re.compile(
+        r"^(?P<identifier>(?:\d{4}\.\d{4,5}|[a-z\-]+(?:\.[a-z\-]+)?/\d{7}))(?:v\d+)?$",
+        re.IGNORECASE,
+    )
 
     _PAPER_FIELDS = (
         "paperId,corpusId,title,abstract,authors,year,publicationDate,venue,url,"
@@ -733,13 +737,34 @@ class SemanticScholarConnector:
             raise ValueError("paper_id must not be empty.")
 
         lowered = normalized_identifier.lower()
-        if lowered.startswith(("doi:", "corpusid:", "arxiv:", "acl:", "pmid:", "pmcid:")):
+        if lowered.startswith("arxiv:"):
+            return SemanticScholarConnector._normalize_arxiv_identifier(
+                normalized_identifier.split(":", 1)[1]
+            )
+        if "/abs/" in lowered:
+            return SemanticScholarConnector._normalize_arxiv_identifier(
+                normalized_identifier.rsplit("/", 1)[-1]
+            )
+        if "/pdf/" in lowered:
+            return SemanticScholarConnector._normalize_arxiv_identifier(
+                normalized_identifier.rsplit("/", 1)[-1].removesuffix(".pdf")
+            )
+        if lowered.startswith(("doi:", "corpusid:", "acl:", "pmid:", "pmcid:")):
             return normalized_identifier
+        if SemanticScholarConnector._ARXIV_IDENTIFIER_PATTERN.fullmatch(normalized_identifier):
+            return SemanticScholarConnector._normalize_arxiv_identifier(normalized_identifier)
 
         if normalized_identifier.startswith("10."):
             return f"DOI:{normalized_identifier}"
 
         return normalized_identifier
+
+    @staticmethod
+    def _normalize_arxiv_identifier(arxiv_id: str) -> str:
+        matched = SemanticScholarConnector._ARXIV_IDENTIFIER_PATTERN.fullmatch(arxiv_id.strip())
+        if not matched:
+            return arxiv_id.strip()
+        return f"arXiv:{matched.group('identifier')}"
 
     @staticmethod
     def _normalize_identifier_list(

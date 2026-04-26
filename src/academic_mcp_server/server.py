@@ -306,6 +306,35 @@ def _build_pending_relation_response(
     )
 
 
+def _build_remaining_relation_queue(
+    *,
+    relation_name: str,
+    relation_response: PaperCollectionResponse,
+) -> dict[str, Any] | None:
+    if relation_response.next_offset is None:
+        return None
+
+    current_offset = relation_response.offset or 0
+    items_returned = len(relation_response.items)
+    total = relation_response.total
+    remaining_items_estimate: int | None = None
+    if total is not None:
+        remaining_items_estimate = max(total - relation_response.next_offset, 0)
+
+    return {
+        "relation": relation_name,
+        "identifier": relation_response.identifier,
+        "offset": current_offset,
+        "limit": relation_response.limit,
+        "next_offset": relation_response.next_offset,
+        "items_returned": items_returned,
+        "total": total,
+        "remaining_items_estimate": remaining_items_estimate,
+        "queue_exhausted": False,
+        "status": "has_more_pages",
+    }
+
+
 def _select_survey_candidates(papers: list[Paper], *, limit: int) -> list[Paper]:
     ranked_candidates = sorted(
         enumerate(papers),
@@ -766,6 +795,7 @@ async def _build_survey_paper_context(
     )
 
     pending_relations: list[dict[str, Any]] = []
+    remaining_queues: list[dict[str, Any]] = []
     for relation_name, relation_response in (("references", references), ("citations", citations)):
         relation_metadata = relation_response.response_metadata
         if relation_metadata.get("blocking_closure"):
@@ -778,6 +808,12 @@ async def _build_survey_paper_context(
                     "message": relation_metadata.get("message"),
                 }
             )
+        remaining_queue = _build_remaining_relation_queue(
+            relation_name=relation_name,
+            relation_response=relation_response,
+        )
+        if remaining_queue is not None:
+            remaining_queues.append(remaining_queue)
 
     return {
         "query_paper_id": paper_id,
@@ -798,7 +834,10 @@ async def _build_survey_paper_context(
         "relation_audit": {
             "pending_count": len(pending_relations),
             "pending_relations": pending_relations,
-            "closure_blocked": bool(pending_relations),
+            "remaining_queue_count": len(remaining_queues),
+            "remaining_queues": remaining_queues,
+            "has_unfetched_relation_pages": bool(remaining_queues),
+            "closure_blocked": bool(pending_relations or remaining_queues),
         },
         "arxiv_match": arxiv_match,
         "arxiv_full_text": arxiv_full_text_result,
@@ -934,6 +973,7 @@ async def survey_query_contexts(
     skipped_candidates: list[dict[str, Any]] = []
     title_only_papers: list[dict[str, Any]] = []
     pending_relation_jobs: list[dict[str, Any]] = []
+    remaining_relation_queues: list[dict[str, Any]] = []
     for paper in selected_papers:
         paper_identifier = _paper_identifier_for_survey_context(paper)
         if paper_identifier is None:
@@ -960,6 +1000,7 @@ async def survey_query_contexts(
         contexts.append(context_result)
         relation_audit = context_result.get("relation_audit") or {}
         pending_relation_jobs.extend(relation_audit.get("pending_relations") or [])
+        remaining_relation_queues.extend(relation_audit.get("remaining_queues") or [])
         content_assessment = context_result.get("content_assessment") or {}
         if content_assessment.get("basis") == "title_only":
             title_only_papers.append(
@@ -988,7 +1029,11 @@ async def survey_query_contexts(
         "closure_audit": {
             "pending_relation_jobs": pending_relation_jobs,
             "pending_relation_count": len(pending_relation_jobs),
+            "remaining_relation_queues": remaining_relation_queues,
+            "remaining_relation_queue_count": len(remaining_relation_queues),
             "closure_blocked_by_pending_relations": bool(pending_relation_jobs),
+            "closure_blocked_by_remaining_relation_pages": bool(remaining_relation_queues),
+            "closure_blocked": bool(pending_relation_jobs or remaining_relation_queues),
         },
         "title_only_papers": title_only_papers,
         "title_only_count": len(title_only_papers),
