@@ -65,7 +65,7 @@ Use absolute paths so the server can start even when a different workspace is op
 		{
 			"type": "promptString",
 			"id": "academic-paper-semantic-scholar-api-key",
-			"description": "Semantic Scholar API key for academicPaperSearch (optional)",
+			"description": "Semantic Scholar API key for academicPaperSearch (required)",
 			"password": true
 		},
 		{
@@ -116,7 +116,7 @@ Create `.vscode/mcp.json` locally when you want the config to follow the current
 		{
 			"type": "promptString",
 			"id": "academic-paper-semantic-scholar-api-key",
-			"description": "Semantic Scholar API key for academicPaperSearch (optional)",
+			"description": "Semantic Scholar API key for academicPaperSearch (required)",
 			"password": true
 		},
 		{
@@ -158,9 +158,10 @@ This repository ignores `.vscode/mcp.json`, so you can keep a workspace-local ov
 
 Environment variables consumed by the server:
 
-- `ACADEMIC_MCP_SEMANTIC_SCHOLAR_API_KEY`
+- `ACADEMIC_MCP_SEMANTIC_SCHOLAR_API_KEY` (required)
 - `ACADEMIC_MCP_CONTACT_EMAIL`
 - `ACADEMIC_MCP_REQUEST_TIMEOUT_SECONDS` (optional, default `20`)
+- `ACADEMIC_MCP_ARXIV_EXPORT_QUERY_TIMEOUT_SECONDS` (optional, default `60`; used for `arxiv_search` Atom queries on `export.arxiv.org`; effective value is `max(REQUEST_TIMEOUT, this value)`)
 - `ACADEMIC_MCP_CACHE_TTL_SECONDS` (optional, default `300`)
 - `ACADEMIC_MCP_DEFAULT_LIMIT` (optional, default `10`)
 
@@ -309,7 +310,7 @@ VS Code の user profile 側の `mcp.json` にサーバー設定をマージし�
 		{
 			"type": "promptString",
 			"id": "academic-paper-semantic-scholar-api-key",
-			"description": "Semantic Scholar API key for academicPaperSearch (optional)",
+			"description": "Semantic Scholar API key for academicPaperSearch (required)",
 			"password": true
 		},
 		{
@@ -354,7 +355,7 @@ macOS / Linux では Python 実行ファイルのパスを `.venv/bin/python` �
 		{
 			"type": "promptString",
 			"id": "academic-paper-semantic-scholar-api-key",
-			"description": "Semantic Scholar API key for academicPaperSearch (optional)",
+			"description": "Semantic Scholar API key for academicPaperSearch (required)",
 			"password": true
 		},
 		{
@@ -390,9 +391,10 @@ macOS / Linux では Python 実行ファイルのパスを `.venv/bin/python` �
 
 サーバーが利用する環境変数:
 
-- `ACADEMIC_MCP_SEMANTIC_SCHOLAR_API_KEY`
+- `ACADEMIC_MCP_SEMANTIC_SCHOLAR_API_KEY`（必須）
 - `ACADEMIC_MCP_CONTACT_EMAIL`
 - `ACADEMIC_MCP_REQUEST_TIMEOUT_SECONDS`（任意、既定値 `20`）
+- `ACADEMIC_MCP_ARXIV_EXPORT_QUERY_TIMEOUT_SECONDS`（任意、既定値 `60`。`arxiv_search` が使う `export.arxiv.org` のクエリ専用。実効値は `max(REQUEST_TIMEOUT, 本変数)`）
 - `ACADEMIC_MCP_CACHE_TTL_SECONDS`（任意、既定値 `300`）
 - `ACADEMIC_MCP_DEFAULT_LIMIT`（任意、既定値 `10`）
 

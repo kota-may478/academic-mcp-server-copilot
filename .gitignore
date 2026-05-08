@@ -4,6 +4,10 @@ __pycache__/
 *.pyo
 *.pyd
 
+# venv
+.venv/
+.venv/*
+
 # Test and type-check caches
 .pytest_cache/
 .mypy_cache/
