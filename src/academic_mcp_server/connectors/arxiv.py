@@ -25,6 +25,7 @@ class ArxivConnector:
 
     _MAX_SOURCE_MEMBER_BYTES = 10_000_000
     _MAX_SOURCE_TOTAL_BYTES = 50_000_000
+    _RATE_LIMIT_BACKOFF_SECONDS = 60.0  # Default wait after 429 when Retry-After header is absent
 
     def __init__(self, config: AppConfig) -> None:
         self._default_limit = config.default_limit
@@ -288,19 +289,49 @@ class ArxivConnector:
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
 
+            # First attempt
             try:
                 response = await client.get(path, params=params)
+            except httpx.HTTPError as exc:
+                self._last_request_finished_at = time.monotonic()
+                raise RuntimeError(
+                    f"{error_label} request failed: {type(exc).__name__}: {exc}"
+                ) from exc
+            self._last_request_finished_at = time.monotonic()
+
+            # On 429 rate limit: back off using Retry-After header and retry once
+            if response.status_code == 429:
+                backoff = self._parse_retry_after(response)
+                await asyncio.sleep(backoff)
+                self._last_request_finished_at = time.monotonic()
+                try:
+                    response = await client.get(path, params=params)
+                except httpx.HTTPError as exc:
+                    self._last_request_finished_at = time.monotonic()
+                    raise RuntimeError(
+                        f"{error_label} request failed on retry: {type(exc).__name__}: {exc}"
+                    ) from exc
+                self._last_request_finished_at = time.monotonic()
+
+            try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 raise RuntimeError(
                     f"{error_label} returned HTTP {exc.response.status_code}."
                 ) from exc
-            except httpx.HTTPError as exc:
-                raise RuntimeError(f"{error_label} request failed: {exc}") from exc
-            finally:
-                self._last_request_finished_at = time.monotonic()
 
         return response
+
+    @staticmethod
+    def _parse_retry_after(response: httpx.Response) -> float:
+        """Return the number of seconds to wait based on a Retry-After header, or the default backoff."""
+        header = response.headers.get("Retry-After")
+        if header is not None:
+            try:
+                return max(float(header), 1.0)
+            except ValueError:
+                pass
+        return ArxivConnector._RATE_LIMIT_BACKOFF_SECONDS
 
     def _extract_source_files(
         self,
