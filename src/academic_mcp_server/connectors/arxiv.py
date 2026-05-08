@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import io
+import random
 import re
 import tarfile
 import time
@@ -26,6 +27,10 @@ class ArxivConnector:
     _MAX_SOURCE_MEMBER_BYTES = 10_000_000
     _MAX_SOURCE_TOTAL_BYTES = 50_000_000
     _RATE_LIMIT_BACKOFF_SECONDS = 60.0  # Default wait after 429 when Retry-After header is absent
+    _REQUEST_RETRY_ATTEMPTS = 3
+    _REQUEST_RETRY_BASE_SECONDS = 2.0
+    _REQUEST_RETRY_MAX_SECONDS = 10.0
+    _REQUEST_RETRY_JITTER_MAX_SECONDS = 0.5
 
     def __init__(self, config: AppConfig) -> None:
         self._default_limit = config.default_limit
@@ -46,6 +51,7 @@ class ArxivConnector:
         self._request_lock = asyncio.Lock()
         self._last_request_finished_at = 0.0
         self._minimum_interval_seconds = 3.0
+        self._arxiv_export_query_timeout = config.arxiv_export_query_timeout_seconds
 
     async def aclose(self) -> None:
         await asyncio.gather(
@@ -72,7 +78,8 @@ class ArxivConnector:
                 "max_results": normalized_limit,
                 "sortBy": "relevance",
                 "sortOrder": "descending",
-            }
+            },
+            request_timeout=self._arxiv_export_query_timeout,
         )
         result = PaperSearchResponse(
             source="arxiv",
@@ -149,12 +156,18 @@ class ArxivConnector:
             + " ".join(notes)
         )
 
-    async def _get_feed(self, *, params: dict[str, Any]) -> feedparser.FeedParserDict:
+    async def _get_feed(
+        self,
+        *,
+        params: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> feedparser.FeedParserDict:
         response = await self._get_response(
             self._client,
             "/api/query",
             params=params,
             error_label="arXiv",
+            request_timeout=request_timeout,
         )
 
         feed = feedparser.parse(response.text)
@@ -281,6 +294,7 @@ class ArxivConnector:
         *,
         params: dict[str, Any] | None = None,
         error_label: str,
+        request_timeout: float | None = None,
     ) -> httpx.Response:
         async with self._request_lock:
             wait_seconds = self._minimum_interval_seconds - (
@@ -289,15 +303,32 @@ class ArxivConnector:
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
 
-            # First attempt
-            try:
-                response = await client.get(path, params=params)
-            except httpx.HTTPError as exc:
+            get_kwargs: dict[str, Any] = {}
+            if request_timeout is not None:
+                get_kwargs["timeout"] = request_timeout
+
+            response: httpx.Response | None = None
+            for attempt in range(self._REQUEST_RETRY_ATTEMPTS):
+                try:
+                    response = await client.get(path, params=params, **get_kwargs)
+                except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                    self._last_request_finished_at = time.monotonic()
+                    if attempt < self._REQUEST_RETRY_ATTEMPTS - 1:
+                        await asyncio.sleep(self._get_retry_delay_seconds(attempt))
+                        continue
+                    raise RuntimeError(
+                        f"{error_label} request failed: {type(exc).__name__}: {exc}"
+                    ) from exc
+                except httpx.HTTPError as exc:
+                    self._last_request_finished_at = time.monotonic()
+                    raise RuntimeError(
+                        f"{error_label} request failed: {type(exc).__name__}: {exc}"
+                    ) from exc
                 self._last_request_finished_at = time.monotonic()
-                raise RuntimeError(
-                    f"{error_label} request failed: {type(exc).__name__}: {exc}"
-                ) from exc
-            self._last_request_finished_at = time.monotonic()
+                break
+
+            if response is None:
+                raise RuntimeError(f"{error_label} request failed: response unavailable.")
 
             # On 429 rate limit: back off using Retry-After header and retry once
             if response.status_code == 429:
@@ -305,7 +336,7 @@ class ArxivConnector:
                 await asyncio.sleep(backoff)
                 self._last_request_finished_at = time.monotonic()
                 try:
-                    response = await client.get(path, params=params)
+                    response = await client.get(path, params=params, **get_kwargs)
                 except httpx.HTTPError as exc:
                     self._last_request_finished_at = time.monotonic()
                     raise RuntimeError(
@@ -321,6 +352,12 @@ class ArxivConnector:
                 ) from exc
 
         return response
+
+    def _get_retry_delay_seconds(self, attempt: int) -> float:
+        return min(
+            self._REQUEST_RETRY_MAX_SECONDS,
+            self._REQUEST_RETRY_BASE_SECONDS * float(2**attempt),
+        ) + random.uniform(0.0, self._REQUEST_RETRY_JITTER_MAX_SECONDS)
 
     @staticmethod
     def _parse_retry_after(response: httpx.Response) -> float:
