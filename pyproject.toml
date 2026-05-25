@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 academic-mcp-server = "academic_mcp_server.server:main"
+survey-cli = "academic_mcp_server.survey.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

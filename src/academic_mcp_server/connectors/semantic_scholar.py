@@ -129,6 +129,65 @@ class SemanticScholarConnector:
         self._cache.set(cache_key, result)
         return result
 
+    async def search_all_pages(
+        self,
+        query: str,
+        *,
+        page_size: int = 100,
+        max_pages: int = 30,
+        max_results: int | None = None,
+    ) -> PaperSearchResponse:
+        normalized_query = query.strip()
+        if not normalized_query:
+            raise ValueError("query must not be empty.")
+        normalized_page_size = min(max(page_size, 1), 100)
+        pages = max(max_pages, 1)
+        cache_key = f"search_all:{normalized_query}:{normalized_page_size}:{pages}:{max_results}"
+        cached = self._cache.get(cache_key)
+        if isinstance(cached, PaperSearchResponse):
+            return cached
+        offset = 0
+        all_items: list[Paper] = []
+        total: int | None = None
+        for _ in range(pages):
+            payload = await self._get_json(
+                self._graph_client,
+                "/paper/search",
+                params={
+                    "query": normalized_query,
+                    "limit": normalized_page_size,
+                    "offset": offset,
+                    "fields": self._PAPER_FIELDS,
+                },
+            )
+            batch = [
+                normalize_semantic_scholar_paper(item)
+                for item in payload.get("data") or []
+            ]
+            if total is None:
+                total = payload.get("total")
+            if not batch:
+                break
+            all_items.extend(batch)
+            if max_results is not None and len(all_items) >= max_results:
+                all_items = all_items[:max_results]
+                break
+            offset += len(batch)
+            if total is not None and offset >= total:
+                break
+            if len(batch) < normalized_page_size:
+                break
+        result = PaperSearchResponse(
+            source="semantic_scholar",
+            query=normalized_query,
+            limit=len(all_items),
+            total=total,
+            items=all_items,
+        )
+        self._cache_papers(result.items)
+        self._cache.set(cache_key, result)
+        return result
+
     async def get_paper(self, paper_id: str) -> Paper:
         normalized_identifier = self._normalize_identifier(paper_id)
         cache_key = f"paper:{normalized_identifier}"
