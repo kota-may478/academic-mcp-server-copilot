@@ -6,6 +6,7 @@ import re
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, AsyncIterator, cast
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -16,8 +17,11 @@ from academic_mcp_server.common.normalize import first_text, normalize_limit, no
 from academic_mcp_server.connectors import ArxivConnector, CrossrefConnector, OpenAlexConnector, SemanticScholarConnector
 from academic_mcp_server.connectors.semantic_scholar import SemanticScholarRateLimitError
 from academic_mcp_server.survey.analysis import analyze_corpus
+from academic_mcp_server.survey.content_acquisition import enrich_strong_content
 from academic_mcp_server.survey.enrich import enrich_crossref
 from academic_mcp_server.survey.generate import generate_docs
+from academic_mcp_server.survey.stats import write_step3_stats
+from academic_mcp_server.survey.validate import validate_survey
 
 
 LOGGER = logging.getLogger(__name__)
@@ -1434,6 +1438,21 @@ async def survey_enrich_crossref(mirror_dir: str, scope: str = "strong", ctx: Co
     ctx.info("Survey Crossref enrich", mirror_dir=mirror_dir, scope=scope)
     return await asyncio.to_thread(enrich_crossref, mirror_dir, scope)
 
+@mcp.tool(
+    name="survey_enrich_content",
+    description="Fetch abstracts (SS then OpenAlex). scope=pre_screening: all entries before Step 5 (Step 4.5); scope=strong: kept+strong only (Step 5.5/8).",
+)
+async def survey_enrich_content(
+    mirror_dir: str,
+    scope: str = "pre_screening",
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    ctx.info("Survey content enrich", mirror_dir=mirror_dir, scope=scope)
+    from academic_mcp_server.survey.content_acquisition import enrich_content
+
+    return await asyncio.to_thread(enrich_content, mirror_dir, scope=scope)
+
 @mcp.tool(name="survey_analyze_corpus", description="Quantitative survey corpus analysis.")
 async def survey_analyze_corpus(mirror_dir: str, ctx: Context | None = None) -> dict[str, Any]:
     ctx = _require_context(ctx)
@@ -1445,6 +1464,52 @@ async def survey_generate_docs(mirror_dir: str, ctx: Context | None = None) -> d
     ctx = _require_context(ctx)
     ctx.info("Survey doc generation", mirror_dir=mirror_dir)
     return await asyncio.to_thread(generate_docs, mirror_dir)
+
+@mcp.tool(name="survey_write_step3_stats", description="Write _step3_stats.json after Step 3 keyword extraction.")
+async def survey_write_step3_stats(mirror_dir: str, ctx: Context | None = None) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    ctx.info("Survey Step 3 stats", mirror_dir=mirror_dir)
+    return await asyncio.to_thread(write_step3_stats, mirror_dir)
+
+@mcp.tool(name="survey_validate_corpus", description="Validate strong-only References invariant and metadata completeness.")
+async def survey_validate_corpus(mirror_dir: str, article_path: str = "", ctx: Context | None = None) -> dict[str, Any]:
+    ctx = _require_context(ctx)
+    ctx.info("Survey validate", mirror_dir=mirror_dir, article_path=article_path or None)
+    ap = article_path.strip() or None
+    return await asyncio.to_thread(validate_survey, mirror_dir, article_path=ap)
+
+
+@mcp.tool(
+    name="survey_validate_phase_b",
+    description=(
+        "Phase B gate: pipe-table column alignment, canonical [Rxxx](#^refRxxx) links, "
+        "^ref block IDs, plus strong-only References (same as validate)."
+    ),
+)
+async def survey_validate_phase_b(
+    mirror_dir: str,
+    article_path: str = "",
+    check_corpus: bool = True,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    from academic_mcp_server.survey.master_list import load_survey_config, resolve_python_mirror_dir
+    from academic_mcp_server.survey.phase_b_validate import validate_phase_b_article
+
+    ctx = _require_context(ctx)
+    mirror = resolve_python_mirror_dir(mirror_dir)
+    ap = article_path.strip()
+    if not ap:
+        cfg = load_survey_config(mirror)
+        name = cfg.get("survey_name", "survey")
+        vault = Path(cfg.get("vault_survey_dir", mirror))
+        ap = str(vault / f"{name}.md")
+    ctx.info("Survey validate Phase B", mirror_dir=str(mirror), article_path=ap)
+    return await asyncio.to_thread(
+        validate_phase_b_article,
+        ap,
+        mirror_dir=mirror,
+        check_corpus=check_corpus,
+    )
 
 def main() -> None:
     logging.basicConfig(

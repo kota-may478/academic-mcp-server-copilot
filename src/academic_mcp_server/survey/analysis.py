@@ -6,17 +6,21 @@ from collections import Counter, defaultdict
 from itertools import combinations
 from pathlib import Path
 
-from academic_mcp_server.survey.master_list import load_survey_config, master_list_path
-# Default import for backwards compatibility
+from academic_mcp_server.survey.master_list import (
+    is_kept_entry,
+    is_strong_corpus_entry,
+    load_survey_config,
+    master_list_path,
+    resolve_python_mirror_dir,
+)
 from academic_mcp_server.survey.topics_ipt import TOPICS as _DEFAULT_TOPICS, assign_subtopics as _DEFAULT_ASSIGN
+from academic_mcp_server.survey.topics_loader import load_topics_symbols
 
 
 def _load_topics_for_dir(mirror: Path):
-    """Load TOPICS and assign_subtopics from survey_config topics_module if set."""
     cfg = load_survey_config(mirror)
-    mod_name = cfg.get("topics_module", "academic_mcp_server.survey.topics_ipt")
-    mod = importlib.import_module(mod_name)
-    return getattr(mod, "TOPICS", _DEFAULT_TOPICS), getattr(mod, "assign_subtopics", _DEFAULT_ASSIGN)
+    _, _, topics, _, assign = load_topics_symbols(cfg)
+    return topics, assign
 
 
 TOPICS = _DEFAULT_TOPICS
@@ -24,7 +28,7 @@ assign_subtopics = _DEFAULT_ASSIGN
 
 
 def _strong_corpus(ml: list[dict]) -> list[dict]:
-    return [e for e in ml if e.get("relevance") == "kept" and e.get("relation_strength") == "strong"]
+    return [e for e in ml if is_strong_corpus_entry(e)]
 
 
 def _year_histogram_by_discovered_in(entries: list[dict]) -> dict[str, dict[str, int]]:
@@ -71,10 +75,11 @@ def _build_topic_index(strong: list[dict]) -> tuple[dict[str, list[dict]], dict[
 def analyze_corpus(mirror_dir: Path | str) -> dict:
     global TOPICS, assign_subtopics
     mirror = Path(mirror_dir).expanduser().resolve()
-    TOPICS, assign_subtopics = _load_topics_for_dir(mirror)
-    with open(master_list_path(mirror), encoding="utf-8") as f:
+    pydir = resolve_python_mirror_dir(mirror)
+    TOPICS, assign_subtopics = _load_topics_for_dir(pydir)
+    with open(master_list_path(pydir), encoding="utf-8") as f:
         ml: list[dict] = json.load(f)
-    kept = [e for e in ml if e.get("relevance") == "kept"]
+    kept = [e for e in ml if is_kept_entry(e)]
     strong = _strong_corpus(ml)
     topic_papers, subtopic_papers = _build_topic_index(strong)
     assigned = {e.get("candidate_key") for papers in topic_papers.values() for e in papers}
@@ -88,7 +93,8 @@ def analyze_corpus(mirror_dir: Path | str) -> dict:
             "removed": len([e for e in ml if str(e.get("relevance", "")).startswith("removed")]),
             "unassigned_strong": len(unassigned),
         },
-        "year_histogram_by_discovered_in": _year_histogram_by_discovered_in(kept),
+        "year_histogram_by_discovered_in": _year_histogram_by_discovered_in(strong),
+        "year_histogram_scope": "strong_corpus_only",
         "content_basis_breakdown": _content_basis_breakdown(strong),
         "keyword_cooccurrence_top_pairs": _keyword_cooccurrence(strong),
         "topics": TOPICS,

@@ -70,6 +70,40 @@ def save_master_list(path: Path, ml: list[dict]) -> None:
         json.dump(ml, f, ensure_ascii=False, indent=2)
 
 
+def mark_keywords_from_step(entry: dict, step: str) -> None:
+    """Record keyword provenance after agent re-extraction in Step 3 / 5.5 / 8."""
+    entry["keywords_source_step"] = step
+    entry["keywords_stale"] = False
+
+
+def mark_screened(entry: dict, step: str) -> None:
+    entry["screened_at_step"] = step
+
+
+def is_seed_entry(entry: dict) -> bool:
+    return "step1_seed" in (entry.get("discovered_in") or [])
+
+
+def is_kept_entry(entry: dict) -> bool:
+    if entry.get("relevance") == "kept":
+        return True
+    # Seed immunity: Step 1 seeds are strong corpus members even before Step 5 sets relevance.
+    return is_seed_entry(entry) and entry.get("relation_strength") == "strong"
+
+
+def is_strong_corpus_entry(entry: dict) -> bool:
+    return is_kept_entry(entry) and entry.get("relation_strength") == "strong"
+
+
+def resolve_python_mirror_dir(mirror_dir: Path | str) -> Path:
+    mirror = Path(mirror_dir).expanduser().resolve()
+    cfg_path = mirror / SURVEY_CONFIG
+    if cfg_path.is_file():
+        cfg = load_survey_config(mirror)
+        return Path(cfg.get("python_survey_dir", mirror)).expanduser().resolve()
+    return mirror
+
+
 def load_survey_config(mirror_dir: Path) -> dict:
     cfg_path = mirror_dir / SURVEY_CONFIG
     with open(cfg_path, encoding="utf-8") as f:

@@ -1,53 +1,31 @@
 from __future__ import annotations
 
 import json
-import os
-import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
-from academic_mcp_server.survey.master_list import ARXIV_DOI_PREFIX, master_list_path, save_master_list
+from academic_mcp_server.survey.api_gateway import cr_get_path, oa_get_path, polite_sleep
+from academic_mcp_server.survey.master_list import (
+    ARXIV_DOI_PREFIX,
+    is_kept_entry,
+    is_strong_corpus_entry,
+    master_list_path,
+    resolve_python_mirror_dir,
+    save_master_list,
+)
 
-CR_API_BASE = "https://api.crossref.org"
-OA_API_BASE = "https://api.openalex.org"
-RATE_SLEEP = 0.35
-MAX_RETRIES = 5
-
-
-def _http_get_json(url: str, headers: dict | None = None) -> dict | None:
-    hdrs = {"User-Agent": "academic-mcp-server/survey-enrich/1.0"}
-    if headers:
-        hdrs.update(headers)
-    for attempt in range(MAX_RETRIES):
-        try:
-            req = urllib.request.Request(url, headers=hdrs)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            if e.code in (429, 500, 502, 503, 504):
-                time.sleep(2 * (attempt + 1))
-                continue
-            if e.code == 404:
-                return None
-            time.sleep(2 * (attempt + 1))
-        except Exception:
-            time.sleep(2 * (attempt + 1))
-    return None
+ENRICH_CHECKPOINT = 500
 
 
 def cr_fetch_work(doi: str) -> dict | None:
     enc = urllib.parse.quote(doi, safe="/")
-    data = _http_get_json(f"{CR_API_BASE}/works/{enc}")
+    data = cr_get_path(f"/works/{enc}")
     return (data or {}).get("message")
 
 
 def oa_fetch_work_id(doi: str) -> str:
-    email = os.environ.get("OPENALEX_EMAIL", "")
-    mail = f"mailto={urllib.parse.quote(email)}&" if email else ""
     enc = urllib.parse.quote(doi, safe="/")
-    data = _http_get_json(f"{OA_API_BASE}/works/doi:{enc}?{mail}select=id")
+    data = oa_get_path(f"/works/doi:{enc}?select=id")
     if not data:
         return ""
     wid = data.get("id") or ""
@@ -97,21 +75,19 @@ def format_crossref_metadata(msg: dict | None, doi: str) -> str:
     return f"{line} DOI: {doi}".strip()
 
 
-ENRICH_CHECKPOINT = 500
-
-
 def enrich_crossref(mirror_dir: Path | str, scope: str = "strong") -> dict[str, int]:
     mirror = Path(mirror_dir).expanduser().resolve()
-    path = master_list_path(mirror)
+    pydir = resolve_python_mirror_dir(mirror)
+    path = master_list_path(pydir)
     with open(path, encoding="utf-8") as f:
         ml: list[dict] = json.load(f)
     enriched = 0
     processed = 0
     for entry in ml:
         if scope != "collection":
-            if entry.get("relevance") != "kept":
+            if scope == "strong" and not is_strong_corpus_entry(entry):
                 continue
-            if scope == "strong" and entry.get("relation_strength") != "strong":
+            if scope == "all" and not is_kept_entry(entry):
                 continue
         ck = entry.get("candidate_key") or ""
         if not ck.startswith("DOI:"):
@@ -128,12 +104,12 @@ def enrich_crossref(mirror_dir: Path | str, scope: str = "strong") -> dict[str, 
             if meta:
                 entry["crossref_metadata"] = meta
                 enriched += 1
-            time.sleep(RATE_SLEEP)
+            polite_sleep()
         if need_oa:
             oa_id = oa_fetch_work_id(doi)
             if oa_id:
                 entry["openalex_id"] = oa_id
-            time.sleep(RATE_SLEEP)
+            polite_sleep()
         processed += 1
         if processed % ENRICH_CHECKPOINT == 0:
             save_master_list(path, ml)

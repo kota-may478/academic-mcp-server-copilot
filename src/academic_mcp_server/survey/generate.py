@@ -1,30 +1,23 @@
 from __future__ import annotations
-import importlib
 import json
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
 from academic_mcp_server.survey.analysis import analyze_corpus
+from academic_mcp_server.survey.ledger import render_structured_ledger
 from academic_mcp_server.survey.markdown import esc_table_cell, fix_internal_ref_links, ref_link
-from academic_mcp_server.survey.master_list import load_survey_config, master_list_path
-# Default import for backwards compatibility
+from academic_mcp_server.survey.master_list import (
+    is_kept_entry,
+    is_strong_corpus_entry,
+    load_survey_config,
+    master_list_path,
+    resolve_python_mirror_dir,
+)
 from academic_mcp_server.survey.topics_ipt import RESEARCH_GAPS, SEED_SUMMARIES, TOPICS, TOPIC_SUMMARIES, assign_subtopics
-
-
-def _load_topics_symbols(cfg: dict):
-    """Load topics module symbols from cfg['topics_module'], falling back to topics_ipt."""
-    mod_name = cfg.get("topics_module", "academic_mcp_server.survey.topics_ipt")
-    mod = importlib.import_module(mod_name)
-    return (
-        getattr(mod, "RESEARCH_GAPS", []),
-        getattr(mod, "SEED_SUMMARIES", {}),
-        getattr(mod, "TOPICS", {}),
-        getattr(mod, "TOPIC_SUMMARIES", {}),
-        getattr(mod, "assign_subtopics"),
-    )
+from academic_mcp_server.survey.topics_loader import load_topics_symbols
 
 def _ordered_strong(ml):
-    kept = [e for e in ml if e.get("relevance") == "kept"]
+    kept = [e for e in ml if is_kept_entry(e)]
     seeds = [e for e in kept if "step1_seed" in (e.get("discovered_in") or [])]
 
     def by_year(ps):
@@ -41,7 +34,10 @@ def _ordered_strong(ml):
     s2 = only("step2_snowball", ["step1_seed"])
     s4 = only("step4_keyword", ["step1_seed", "step2_snowball"])
     s6 = only("step6_snowball", ["step1_seed", "step2_snowball", "step4_keyword"])
-    ordered = [e for e in seeds + by_year(s2) + by_year(s4) + by_year(s6) if e.get("relation_strength") == "strong"]
+    ordered = [
+        e for e in seeds + by_year(s2) + by_year(s4) + by_year(s6)
+        if is_strong_corpus_entry(e)
+    ]
     rids = {e["candidate_key"]: f"R{i:03d}" for i, e in enumerate(ordered, 1)}
     return ordered, rids, kept
 
@@ -133,17 +129,24 @@ def _section3(ordered, rids, kept, weak):
     return "\n".join(lines)
 
 def generate_ledger(ml, cfg):
-    tags = cfg.get("ledger_tags", cfg.get("tags", []))
-    tag_lines = "\n".join("  - " + t for t in tags)
-    today = date.today().isoformat()
-    name = cfg.get("survey_name", "survey")
-    lines = ["---", "number: %s" % cfg.get("ledger_number", 0), "title: %s_Ledger" % name, "tags:", tag_lines, "created: " + today, "status: WIP", "---", "", "# %s Ledger" % name, ""]
-    for e in ml:
-        lines.append("- **%s** ck=%s rel=%s rs=%s" % (e.get("title", "(no title)"), e.get("candidate_key", ""), e.get("relevance"), e.get("relation_strength")))
-    return "\n".join(lines)
+    return render_structured_ledger(ml, cfg)
+
+
+def _section_placeholders(name: str) -> list[str]:
+    return [
+        "## Section 1 — 概要",
+        "",
+        "> **TODO (agent)**: 3–5文の日本語概要（対象語の意味、動機、スコープ、最終コーパス規模、主要所見）。",
+        "",
+        "## Section 2 — Search Strategy",
+        "",
+        "> **TODO (agent)**: Step 1–8 の各サブセクション、コーパスサイズ推移表、軸キーワード一覧。",
+        "",
+    ]
 
 
 def _references(ordered, rids):
+    """References block: strong corpus only (same order as Section 3 / Rxxx IDs)."""
     lines = ["## References", ""]
     for e in ordered:
         r = rids[e["candidate_key"]]
@@ -159,23 +162,22 @@ def _references(ordered, rids):
 def generate_docs(mirror_dir):
     global RESEARCH_GAPS, SEED_SUMMARIES, TOPICS, TOPIC_SUMMARIES, assign_subtopics
     mirror = Path(mirror_dir).expanduser().resolve()
-    cfg = load_survey_config(mirror)
-    if cfg.get("topics_module"):
-        RESEARCH_GAPS, SEED_SUMMARIES, TOPICS, TOPIC_SUMMARIES, assign_subtopics = _load_topics_symbols(cfg)
+    pydir = resolve_python_mirror_dir(mirror)
+    cfg = load_survey_config(pydir)
+    RESEARCH_GAPS, SEED_SUMMARIES, TOPICS, TOPIC_SUMMARIES, assign_subtopics = load_topics_symbols(cfg)
     name = cfg.get("survey_name", "survey")
     vault = Path(cfg.get("vault_survey_dir", mirror))
-    pydir = Path(cfg.get("python_survey_dir", mirror))
     article_path = vault / (name + ".md")
     ledger_path = vault / (name + "_Ledger.md")
     with open(master_list_path(pydir), encoding="utf-8") as f:
         ml = json.load(f)
     ordered, rids, kept = _ordered_strong(ml)
-    weak = [e for e in ml if e.get("relation_strength") == "weak" and e.get("relevance") == "kept"]
-    analysis = analyze_corpus(mirror)
+    weak = [e for e in ml if e.get("relation_strength") == "weak" and is_kept_entry(e)]
+    analysis = analyze_corpus(pydir)
     tags = cfg.get("tags", [cfg.get("target_word", "")])
     tag_lines = chr(10).join("  - " + t for t in tags)
     fm = ["---", "number: %s" % cfg.get("article_number", 0), "title: " + name, "tags:", tag_lines, "created: " + date.today().isoformat(), "status: WIP", "---", "", "> Ref links use [Rxxx](#^refRxxx)", ""]
-    parts = fm + [_section3(ordered, rids, kept, weak), _sections_4_8(ordered, rids, analysis, weak), _references(ordered, rids)]
+    parts = fm + _section_placeholders(name) + [_section3(ordered, rids, kept, weak), _sections_4_8(ordered, rids, analysis, weak), _references(ordered, rids)]
     article = fix_internal_ref_links((chr(10)*2).join(parts))
     article_path.parent.mkdir(parents=True, exist_ok=True)
     with open(article_path, "w", encoding="utf-8") as f:

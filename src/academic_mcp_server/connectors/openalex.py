@@ -27,6 +27,7 @@ class OpenAlexConnector:
     def __init__(self, config: AppConfig) -> None:
         self._default_limit = config.default_limit
         self._contact_email = config.openalex_contact_email
+        self._api_key = config.openalex_api_key
         self._cache: TTLCache[Any] = TTLCache(config.cache_ttl_seconds)
         self._retryable_status_codes = {408, 429, 500, 502, 503, 504}
         self._client = httpx.AsyncClient(
@@ -179,7 +180,11 @@ class OpenAlexConnector:
         )
 
     def _request_params(self, **params: Any) -> dict[str, Any]:
-        request_params = {"mailto": self._contact_email}
+        request_params: dict[str, Any] = {}
+        if self._contact_email:
+            request_params["mailto"] = self._contact_email
+        if self._api_key:
+            request_params["api_key"] = self._api_key
         request_params.update(params)
         return request_params
 

@@ -1,43 +1,20 @@
 from __future__ import annotations
 
 import json
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from datetime import date
 from pathlib import Path
 
+from academic_mcp_server.survey.api_gateway import fetch_ss_abstract, polite_sleep, survey_api_lock
 from academic_mcp_server.survey.enrich import enrich_crossref
 from academic_mcp_server.survey.master_list import load_survey_config, master_list_path, save_master_list
 
 STEP2_STATS = "_step2_stats.json"
-WORKFLOW_STEP3 = Path.home() / "Obsidian/00_kotaprivate/Tool/prompt/survey_workflow_step3plus.prompt.md"
+WORKFLOW_PHASE_A_ANALYSIS = Path.home() / "Obsidian/00_kotaprivate/Tool/prompt/survey_workflow_step3plus.prompt.md"
+WORKFLOW_PHASE_B = Path.home() / "Obsidian/00_kotaprivate/Tool/prompt/survey_workflow_phase_b.prompt.md"
+HANDOFF_PHASE_A_CONTINUE = "handoff_step3.prompt.md"
+HANDOFF_PHASE_B = "handoff_phase_b.prompt.md"
 JSON_FENCE = "```json"
 JSON_FENCE_END = "```"
-
-SS_GRAPH = "https://api.semanticscholar.org/graph/v1"
-RATE_SLEEP = 0.35
-MAX_RETRIES = 5
-
-
-def _http_get_json(url: str) -> dict | None:
-    hdrs = {"User-Agent": "academic-mcp-server/survey-collection/1.0"}
-    for attempt in range(MAX_RETRIES):
-        try:
-            req = urllib.request.Request(url, headers=hdrs)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            if e.code in (429, 500, 502, 503, 504):
-                time.sleep(2 * (attempt + 1))
-                continue
-            if e.code == 404:
-                return None
-            time.sleep(2 * (attempt + 1))
-        except Exception:
-            time.sleep(2 * (attempt + 1))
-    return None
 
 
 def _ss_identifier_from_entry(entry: dict) -> str | None:
@@ -57,30 +34,21 @@ def _ss_identifier_from_entry(entry: dict) -> str | None:
     return None
 
 
-def _fetch_ss_abstract(identifier: str) -> str | None:
-    enc = urllib.parse.quote(identifier.strip(), safe="")
-    url = f"{SS_GRAPH}/paper/{enc}?fields=abstract"
-    data = _http_get_json(url)
-    if not data:
-        return None
-    abstract = (data.get("abstract") or "").strip()
-    return abstract or None
-
-
 def enrich_abstracts_semantic_scholar(ml: list[dict]) -> dict[str, int]:
     filled = 0
-    for entry in ml:
-        if (entry.get("abstract") or "").strip():
-            continue
-        ident = _ss_identifier_from_entry(entry)
-        if not ident:
-            continue
-        abstract = _fetch_ss_abstract(ident)
-        if abstract:
-            entry["abstract"] = abstract
-            entry["abstract_source"] = "semantic_scholar"
-            filled += 1
-        time.sleep(RATE_SLEEP)
+    with survey_api_lock():
+        for entry in ml:
+            if (entry.get("abstract") or "").strip():
+                continue
+            ident = _ss_identifier_from_entry(entry)
+            if not ident:
+                continue
+            abstract = fetch_ss_abstract(ident)
+            if abstract:
+                entry["abstract"] = abstract
+                entry["abstract_source"] = "semantic_scholar"
+                filled += 1
+            polite_sleep()
     return {"abstracts_filled": filled}
 
 
@@ -159,9 +127,9 @@ def render_ledger_collection(ml: list[dict], cfg: dict, step2_stats, enrich_resu
         "phase: collection",
         "---",
         "",
-        f"# {name} — Collection Ledger (Phase A)",
+        f"# {name} — Collection Ledger (Phase A checkpoint)",
         "",
-        f"Step 9 produces the final {name}_Ledger.md; this file aggregates all papers after Steps 1–2 (pre-screening).",
+        f"Phase A continues through Step 9; this file is a snapshot after Steps 1–2 (pre-screening). Final ledger: {name}_Ledger.md.",
         "",
         f"- Total entries: **{len(ml)}**",
         f"- Step 1 seeds: **{len(seeds)}**",
@@ -182,41 +150,128 @@ def render_ledger_collection(ml: list[dict], cfg: dict, step2_stats, enrich_resu
     return "\n".join(lines)
 
 
+def _strong_criteria_lines(cfg: dict, target: str) -> list[str]:
+    return [
+        line
+        for line in (
+            __import__(
+                "academic_mcp_server.survey.strong_relation_criteria",
+                fromlist=["format_markdown_block"],
+            ).format_markdown_block(cfg.get("strong_relation_criteria"), target).splitlines()
+        )
+    ]
+
+
 def render_handoff(cfg: dict, mirror: Path, vault: Path, ledger_path: Path) -> str:
+    """Phase A continuation handoff for Cursor (Steps 3–8 + Step 9 skeleton)."""
     name = cfg.get("survey_name", "survey")
     target = cfg.get("target_word", "")
-    wf = WORKFLOW_STEP3
+    wf = WORKFLOW_PHASE_A_ANALYSIS
     article = vault / f"{name}.md"
     final_ledger = vault / f"{name}_Ledger.md"
+    step6_limit = int(cfg.get("step6_seed_limit") or 100)
+    finalize_script = Path.home() / "Obsidian/00_kotaprivate/Tool/scripts/survey_analysis_finalize.py"
     return "\n".join([
-        "# Survey handoff — continue from Step 3 (Phase B)",
+        "# Survey handoff — Phase A (continue from Step 3)",
         "",
-        "You are continuing a literature survey after Phase A (Steps 1–2 + collection finalize).",
+        "Continue **Phase A** after Steps 1–2 + collection finalize. **Executor: Cursor.**",
         "Do not redo Steps 1–2 unless the user explicitly resets the mirror.",
         "",
         "## Paths",
         f"- Mirror directory: {mirror}",
         f"- Master list: {mirror / '_working_master_list.json'}",
         f"- survey_config.json: {mirror / 'survey_config.json'}",
-        f"- Collection ledger: {ledger_path}",
-        f"- Workflow prompt (Steps 3–9): {wf}",
-        f"- Target article (Step 9): {article}",
-        f"- Final ledger (Step 9): {final_ledger}",
+        f"- Collection ledger (checkpoint): {ledger_path}",
+        f"- Workflow prompt (Steps 3–8 + Step 9 skeleton): {wf}",
+        f"- Target article (skeleton): {article}",
+        f"- Final ledger (end of Phase A): {final_ledger}",
+        f"- Phase B handoff (after Phase A completes): {vault / HANDOFF_PHASE_B}",
         "",
         "## Survey parameters",
         f"- survey_name: {name}",
         f"- target_word: {target}",
         f"- article_number: {cfg.get('article_number')}",
         f"- ledger_number: {cfg.get('ledger_number')}",
+        f"- step6_seed_limit: {step6_limit}",
         "",
-        "## Instructions",
-        "1. Read the workflow prompt at the path above and execute Steps 3–9.",
-        "2. Use _working_master_list.json as the authoritative deduplication source.",
-        "3. Phase A artifacts (Ledger_Collection, _step2_stats.json, Crossref/OpenAlex fields) are reference only.",
-        "4. Output language: Japanese.",
-        "5. Prefer MCP survey tools; fallback survey-cli with PYTHONPATH=academic-mcp-server-copilot/src.",
+        "## Strong relation minimum conditions",
+        *_strong_criteria_lines(cfg, target),
+        "",
+        "## Instructions (Cursor Phase A — do not write Japanese prose)",
+        "1. Read the workflow prompt above and execute **Steps 3–8**, then **Step 9 skeleton only**.",
+        "2. Use `_working_master_list.json` as the authoritative deduplication source.",
+        "3. Step 3 is title-only for all; **no** abstract API in Step 3.",
+        "4. After Step 4: `survey-cli enrich-content <mirror>` (default scope **pre_screening**) for **all** entries, then `step45_reextract_keywords.py` (Step 4.5).",
+        "5. Step 5 / 7 screening must use title **and** abstract (and P/A/O/M keywords).",
+        "6. After Step 5: `survey-cli enrich-content <mirror> --scope strong` for any strong papers still on title_only; re-extract strong keywords (Step 5.5).",
+        f"7. Step 6.0: `step6_select_seeds.py` → review `_step6_selected_seeds.json` (max **{step6_limit}** strong non-seeds).",
+        "8. Step 6: `step6_snowball.py` on selected seeds only; Step 7 classifies new Step 6 hits.",
+        "9. Step 9: `analyze` → `generate` → final `{name}_Ledger.md` → `validate` (`ok: true`).",
+        "10. **Leave** generator TODO / stubs in Sections 1, 2, 6–8.",
+        "11. **Do not** write Japanese narrative prose — that is **Phase B (Claude Code)**.",
+        "12. When validate passes, run:",
+        f"    python3 {finalize_script} {mirror}",
+        f"11. Hand off to Claude Code with `{HANDOFF_PHASE_B}` + `survey_workflow_phase_b.prompt.md`.",
         "",
     ])
+
+
+def render_handoff_phase_b(cfg: dict, mirror: Path, vault: Path) -> str:
+    """Phase B handoff for Claude Code (Japanese article prose only)."""
+    name = cfg.get("survey_name", "survey")
+    target = cfg.get("target_word", "")
+    wf = WORKFLOW_PHASE_B
+    article = vault / f"{name}.md"
+    final_ledger = vault / f"{name}_Ledger.md"
+    return "\n".join([
+        "# Survey handoff — Phase B (Claude Code: Japanese article)",
+        "",
+        "**Phase A (Cursor)** completed: master list screened, skeleton article and final ledger written, validate passed.",
+        "**Executor: Claude Code.** Write **Japanese prose only** — do not redo literature collection or screening.",
+        "",
+        "## Paths",
+        f"- Workflow prompt: {wf}",
+        f"- Target article: {article}",
+        f"- Final ledger: {final_ledger}",
+        f"- Mirror (read-only unless fixing a factual error): {mirror / '_working_master_list.json'}",
+        "",
+        "## Survey parameters",
+        f"- survey_name: {name}",
+        f"- target_word: {target}",
+        f"- article_number: {cfg.get('article_number')}",
+        "",
+        "## Strong relation minimum conditions",
+        *_strong_criteria_lines(cfg, target),
+        "",
+        "## Instructions",
+        "1. Read `survey_workflow_phase_b.prompt.md` and follow Phase B rules.",
+        "2. Replace all TODO / stub text in Sections **1**, **2**, **6**, **7**, **8** with detailed Japanese.",
+        "3. Expand Section 5 matrix commentary to 4–6 sentences per matrix if the skeleton is shorter.",
+        "4. Improve References one-line Japanese summaries where content is available.",
+        "5. Do **not** alter Section 3–5 tables except factual corrections.",
+        "6. **Mandatory last step** — Phase B validation (`ok: true` required):",
+        f"   python3 {Path.home() / 'Obsidian/00_kotaprivate/Tool/scripts/survey_validate_phase_b.py'} {mirror}",
+        "   Checks: pipe-table column alignment; canonical [Rxxx](#^refRxxx); ^ref block IDs; strong-only References.",
+        "7. Fix all validation **errors** before reporting completion.",
+        "",
+    ])
+
+
+def analysis_finalize(mirror_dir: Path, *, overwrite: bool = True) -> dict:
+    """After Cursor Phase A (validate ok), write handoff_phase_b.prompt.md for Claude Code."""
+    mirror = mirror_dir.expanduser().resolve()
+    cfg = load_survey_config(mirror)
+    vault = Path(cfg.get("vault_survey_dir", mirror))
+    handoff_path = vault / HANDOFF_PHASE_B
+    vault.mkdir(parents=True, exist_ok=True)
+    if overwrite or not handoff_path.is_file():
+        handoff_path.write_text(render_handoff_phase_b(cfg, mirror, vault), encoding="utf-8")
+    return {
+        "mirror_dir": str(mirror),
+        "handoff_phase_b_path": str(handoff_path),
+        "workflow_phase_b_prompt": str(WORKFLOW_PHASE_B),
+        "survey_name": cfg.get("survey_name"),
+    }
 
 
 def collection_finalize(mirror_dir: Path) -> dict:
@@ -226,17 +281,20 @@ def collection_finalize(mirror_dir: Path) -> dict:
     ml_path = master_list_path(mirror)
     with open(ml_path, encoding="utf-8") as f:
         ml: list[dict] = json.load(f)
-    abstract_result = enrich_abstracts_semantic_scholar(ml)
-    save_master_list(ml_path, ml)
     step2_stats = _load_step2_stats(mirror)
-    phase_a_meta = {**enrich_result, **abstract_result}
+    phase_a_meta = {
+        **enrich_result,
+        "abstracts_filled": 0,
+        "abstract_policy": "deferred_to_step_5_5_strong_only",
+    }
     name = cfg.get("survey_name", "survey")
     vault = Path(cfg.get("vault_survey_dir", mirror))
     ledger_path = vault / f"{name}_Ledger_Collection.md"
-    handoff_path = vault / "handoff_step3.prompt.md"
+    handoff_path = vault / HANDOFF_PHASE_A_CONTINUE
     vault.mkdir(parents=True, exist_ok=True)
     ledger_path.write_text(render_ledger_collection(ml, cfg, step2_stats, phase_a_meta), encoding="utf-8")
-    handoff_path.write_text(render_handoff(cfg, mirror, vault, ledger_path), encoding="utf-8")
+    if not handoff_path.is_file():
+        handoff_path.write_text(render_handoff(cfg, mirror, vault, ledger_path), encoding="utf-8")
     return {
         "mirror_dir": str(mirror),
         "ledger_collection_path": str(ledger_path),

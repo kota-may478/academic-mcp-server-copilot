@@ -72,6 +72,7 @@ class AppConfig:
     semantic_scholar_api_key: str
     contact_email: str
     openalex_contact_email: str
+    openalex_api_key: str | None
     request_timeout_seconds: float
     arxiv_export_query_timeout_seconds: float
     cache_ttl_seconds: int
@@ -92,6 +93,8 @@ class AppConfig:
                 _parse_optional_email("ACADEMIC_MCP_OPENALEX_CONTACT_EMAIL")
                 or _parse_email("ACADEMIC_MCP_CONTACT_EMAIL")
             ),
+            openalex_api_key=_clean_env("OPENALEX_API_KEY")
+            or _clean_env("ACADEMIC_MCP_OPENALEX_API_KEY"),
             request_timeout_seconds=request_timeout_seconds,
             arxiv_export_query_timeout_seconds=max(
                 request_timeout_seconds,

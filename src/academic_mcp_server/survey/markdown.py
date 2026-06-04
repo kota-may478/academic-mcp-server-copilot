@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-OLD_LINK_RE = re.compile(r"\[(R\d{3})\]\(#(?:\^ref)?r?\1\)", re.IGNORECASE)
+OLD_LINK_RE = re.compile(r"\[(R\d+)\]\(#(?:\^ref)?r?\1\)", re.IGNORECASE)
 
 
 def ref_link(rid: str) -> str:
