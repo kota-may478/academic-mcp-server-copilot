@@ -102,10 +102,17 @@ def validate_topic_taxonomy_alignment(cfg: dict[str, Any], article_text: str) ->
         return errors
 
     mod_lower = mod.lower()
-    is_ipt_module = "topics_ipt" in mod_lower or "inflight_ipt" in mod_lower
+    # WPT-family taxonomies (IPT, in-flight IPT, robots WPT, …) share near-field
+    # heading markers; only flag when a non-WPT module emits those headings.
+    is_wpt_family_module = (
+        "topics_ipt" in mod_lower
+        or "inflight_ipt" in mod_lower
+        or "topics_wpt" in mod_lower
+        or "_wpt_" in mod_lower
+    )
     has_ipt_headings = any(marker in s4 for marker in _IPT_SECTION4_MARKERS)
 
-    if not is_ipt_module and has_ipt_headings:
+    if not is_wpt_family_module and has_ipt_headings:
         errors.append(
             f"Section 4 contains IPT/WPT topic headings but topics_module is {mod!r}. "
             "Re-run analyze + generate after setting the correct topics_module."

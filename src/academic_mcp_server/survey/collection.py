@@ -9,8 +9,8 @@ from academic_mcp_server.survey.enrich import enrich_crossref
 from academic_mcp_server.survey.master_list import load_survey_config, master_list_path, save_master_list
 
 STEP2_STATS = "_step2_stats.json"
-WORKFLOW_PHASE_A_ANALYSIS = Path.home() / "Obsidian/00_kotaprivate/Tool/prompt/survey_workflow_step3plus.prompt.md"
-WORKFLOW_PHASE_B = Path.home() / "Obsidian/00_kotaprivate/Tool/prompt/survey_workflow_phase_b.prompt.md"
+WORKFLOW_PHASE_A_ANALYSIS = Path.home() / "Obsidian/01_Private/Tool/prompt/survey_workflow_step3plus.prompt.md"
+WORKFLOW_PHASE_B = Path.home() / "Obsidian/01_Private/Tool/prompt/survey_workflow_phase_b.prompt.md"
 HANDOFF_PHASE_A_CONTINUE = "handoff_step3.prompt.md"
 HANDOFF_PHASE_B = "handoff_phase_b.prompt.md"
 JSON_FENCE = "```json"
@@ -170,7 +170,7 @@ def render_handoff(cfg: dict, mirror: Path, vault: Path, ledger_path: Path) -> s
     article = vault / f"{name}.md"
     final_ledger = vault / f"{name}_Ledger.md"
     step6_limit = int(cfg.get("step6_seed_limit") or 100)
-    finalize_script = Path.home() / "Obsidian/00_kotaprivate/Tool/scripts/survey_analysis_finalize.py"
+    finalize_script = Path.home() / "Obsidian/01_Private/Tool/scripts/survey_analysis_finalize.py"
     return "\n".join([
         "# Survey handoff — Phase A (continue from Step 3)",
         "",
@@ -250,7 +250,7 @@ def render_handoff_phase_b(cfg: dict, mirror: Path, vault: Path) -> str:
         "4. Improve References one-line Japanese summaries where content is available.",
         "5. Do **not** alter Section 3–5 tables except factual corrections.",
         "6. **Mandatory last step** — Phase B validation (`ok: true` required):",
-        f"   python3 {Path.home() / 'Obsidian/00_kotaprivate/Tool/scripts/survey_validate_phase_b.py'} {mirror}",
+        f"   python3 {Path.home() / 'Obsidian/01_Private/Tool/scripts/survey_validate_phase_b.py'} {mirror}",
         "   Checks: pipe-table column alignment; canonical [Rxxx](#^refRxxx); ^ref block IDs; strong-only References.",
         "7. Fix all validation **errors** before reporting completion.",
         "",

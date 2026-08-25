@@ -28,7 +28,7 @@ survey_config.json example:
   "topics_module": "academic_mcp_server.survey.topics_inflight_ipt (REQUIRED — set at bootstrap; wrong/missing module yields IPT headings or validate failure)",
   "vault_root": "/home/user/Obsidian",
   "vault_survey_dir": "/home/user/Obsidian/02_HFLab/00_Idea/Survey/MySurvey",
-  "python_survey_dir": "/home/user/00_kotaprivate/Program/python_ForObsidian/vault_mirror/...",
+  "python_survey_dir": "/home/user/01_Private/Program/python_ForObsidian/vault_mirror/...",
   "tags": ["survey", "HFLab"],
   "ledger_tags": ["survey", "HFLab", "ledger"]
 ,
